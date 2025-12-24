@@ -1,8 +1,8 @@
 # dots
 
-> **Connect the dots.**
+> **Like beads, but smaller and faster!**
 
-Minimal task tracker in Zig. Single file, ~1ms startup, no daemon.
+Minimal task tracker in Zig. 358KB binary, ~2ms startup, single file storage.
 
 ## Install
 
@@ -103,13 +103,13 @@ dot ready --json
 
 ## Why dots?
 
-| | beads | dots |
-|---|-------|------|
-| Startup | ~50-100ms | ~1ms |
-| Storage | SQLite + JSONL | JSONL only |
-| Commands | 50+ | 10 |
-| Daemon | Required | None |
-| Config | Complex | Zero |
+| | beads | dots | diff |
+|---|------:|-----:|------|
+| Binary | 19 MB | 358 KB | 53x smaller |
+| Code | 188K lines | 956 lines | 196x smaller |
+| Startup | ~7ms | ~2ms | 3.5x faster |
+| Storage | SQLite + JSONL | JSONL | simpler |
+| Daemon | Required | None | — |
 
 ## License
 
