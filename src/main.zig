@@ -19,7 +19,7 @@ const Command = struct { names: []const []const u8, handler: Handler };
 const commands = [_]Command{
     .{ .names = &.{ "add", "create" }, .handler = cmdAdd },
     .{ .names = &.{ "ls", "list" }, .handler = cmdList },
-    .{ .names = &.{ "it", "do" }, .handler = cmdIt },
+    .{ .names = &.{ "on", "it" }, .handler = cmdOn },
     .{ .names = &.{ "off", "done" }, .handler = cmdOff },
     .{ .names = &.{ "rm", "delete" }, .handler = cmdRm },
     .{ .names = &.{"show"}, .handler = cmdShow },
@@ -150,7 +150,7 @@ const USAGE =
     \\  dot "title"                  Quick add a dot
     \\  dot add "title" [options]    Add a dot (-p priority, -d desc, -P parent, -a after)
     \\  dot ls [--status S] [--json] List dots
-    \\  dot it <id>                  Start working ("I'm on it!")
+    \\  dot on <id>                  Start working (turn it on!)
     \\  dot off <id> [-r reason]     Complete ("cross it off")
     \\  dot rm <id>                  Remove a dot
     \\  dot show <id>                Show dot details
@@ -163,7 +163,7 @@ const USAGE =
     \\  dot "Fix the bug"
     \\  dot add "Design API" -p 1 -d "REST endpoints"
     \\  dot add "Implement" -P bd-1 -a bd-2
-    \\  dot it bd-3
+    \\  dot on bd-3
     \\  dot off bd-3 -r "shipped"
     \\
 ;
@@ -296,8 +296,8 @@ fn writeIssueList(issues: []const sqlite.Issue, skip_done: bool, use_json: bool)
     }
 }
 
-fn cmdIt(allocator: Allocator, args: []const []const u8) !void {
-    if (args.len == 0) fatal("Usage: dot it <id>\n", .{});
+fn cmdOn(allocator: Allocator, args: []const []const u8) !void {
+    if (args.len == 0) fatal("Usage: dot on <id>\n", .{});
 
     var ts_buf: [40]u8 = undefined;
     const now = try formatTimestamp(&ts_buf);

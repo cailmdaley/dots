@@ -111,7 +111,7 @@ test "dot help" {
 
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "dots - Connect the dots") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "dot \"title\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "dot it <id>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "dot on <id>") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "dot off <id>") != null);
 }
 
@@ -173,7 +173,7 @@ test "dot add with json" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"priority\":2") != null);
 }
 
-test "dot it and off workflow" {
+test "dot on and off workflow" {
     const allocator = std.testing.allocator;
 
     const test_dir = try setupTestDir(allocator);
@@ -191,9 +191,9 @@ test "dot it and off workflow" {
     defer allocator.free(add_result.stderr);
 
     // Start work
-    const it_result = try runDot(allocator, &.{ "it", id }, test_dir);
-    defer allocator.free(it_result.stdout);
-    defer allocator.free(it_result.stderr);
+    const on_result = try runDot(allocator, &.{ "on", id }, test_dir);
+    defer allocator.free(on_result.stdout);
+    defer allocator.free(on_result.stderr);
 
     // Check status changed to active
     const list1 = try runDot(allocator, &.{"ls"}, test_dir);

@@ -44,7 +44,7 @@ dot ls
 # Output: [bd-a1b2c3d4] o Fix the login bug
 
 # Start working
-dot it bd-a1b2c3d4
+dot on bd-a1b2c3d4
 # Output: (none, task marked active)
 
 # Complete task
@@ -112,7 +112,7 @@ Output format (JSON):
 ### Start Working
 
 ```bash
-dot it <id>
+dot on <id>
 ```
 Marks task as `active`. Use when you begin working on a task.
 
