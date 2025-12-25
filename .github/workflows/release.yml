@@ -26,22 +26,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install SQLite (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-
-      - name: Install SQLite (macOS)
-        if: runner.os == 'macOS'
-        run: brew install sqlite
+      - name: Download SQLite amalgamation
+        run: |
+          curl -L -o sqlite.zip https://www.sqlite.org/2025/sqlite-amalgamation-3510100.zip
+          unzip sqlite.zip
+          mv sqlite-amalgamation-3510100 sqlite
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
-      - name: Build Release
+      - name: Build Release (static)
         run: |
-          zig build -Doptimize=ReleaseSmall -Dsystem-sqlite=true
+          zig build -Doptimize=ReleaseSmall -Dsqlite-source=sqlite/sqlite3.c
           strip zig-out/bin/dot || true
           mv zig-out/bin/dot ${{ matrix.artifact }}
 

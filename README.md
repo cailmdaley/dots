@@ -4,7 +4,7 @@
 
 > **Like beads, but smaller and faster!**
 
-Minimal task tracker for AI agents. 16x smaller than beads (1.2MB vs 19MB), 2x faster startup (~3ms), built-in Claude Code hooks, beads-compatible SQLite storage.
+Minimal task tracker for AI agents. 21x smaller than beads (0.9MB vs 19MB), 2x faster startup (~3ms), built-in Claude Code hooks, beads-compatible SQLite storage.
 
 ## What is dots?
 
@@ -272,7 +272,7 @@ Both binaries statically link SQLite for zero runtime dependencies.
 
 | | beads | dots | diff |
 |---|------:|-----:|------|
-| Binary | 19 MB | 1.2 MB | 16x smaller |
+| Binary | 19 MB | 0.9 MB | 21x smaller |
 | Code | 188K lines | ~800 lines | 235x smaller |
 | Startup | ~7ms | ~3ms | 2x faster |
 | Storage | SQLite | SQLite | same |

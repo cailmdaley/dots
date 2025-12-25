@@ -24,9 +24,19 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "git_hash", git_hash);
     exe.root_module.addOptions("build_options", options);
 
-    // Link SQLite
-    const use_system = b.option(bool, "system-sqlite", "Use system SQLite instead of static") orelse false;
-    if (use_system) {
+    // Link SQLite - priority: source > static lib > system
+    const sqlite_source = b.option([]const u8, "sqlite-source", "Path to sqlite3.c for static compilation");
+    const use_system = b.option(bool, "system-sqlite", "Use system SQLite (dynamic linking)") orelse false;
+
+    if (sqlite_source) |src_path| {
+        // Compile SQLite from source for fully static binary
+        exe.addCSourceFile(.{
+            .file = .{ .cwd_relative = src_path },
+            .flags = &.{ "-DSQLITE_THREADSAFE=0", "-DSQLITE_OMIT_LOAD_EXTENSION" },
+        });
+        const src_dir = std.fs.path.dirname(src_path) orelse ".";
+        exe.root_module.addIncludePath(.{ .cwd_relative = src_dir });
+    } else if (use_system) {
         exe.root_module.linkSystemLibrary("sqlite3", .{});
     } else if (target.result.os.tag == .macos) {
         // Static link on macOS (Homebrew path)
