@@ -29,6 +29,9 @@ const commands = [_]Command{
     .{ .names = &.{"update"}, .handler = cmdBeadsUpdate },
     .{ .names = &.{"close"}, .handler = cmdBeadsClose },
     .{ .names = &.{"hook"}, .handler = cmdHook },
+    .{ .names = &.{"init"}, .handler = cmdInitWrapper },
+    .{ .names = &.{ "help", "--help", "-h" }, .handler = cmdHelp },
+    .{ .names = &.{ "--version", "-v" }, .handler = cmdVersion },
 };
 
 fn findCommand(name: []const u8) ?Handler {
@@ -38,15 +41,6 @@ fn findCommand(name: []const u8) ?Handler {
         }
     }
     return null;
-}
-
-fn isCommand(s: []const u8) bool {
-    const specials = [_][]const u8{ "init", "help", "--help", "-h", "--version", "-v" };
-    if (findCommand(s) != null) return true;
-    inline for (specials) |sp| {
-        if (std.mem.eql(u8, s, sp)) return true;
-    }
-    return false;
 }
 
 pub fn main() !void {
@@ -64,25 +58,24 @@ pub fn main() !void {
 
     const cmd = args[1];
 
-    // Quick add: dot "title"
-    if (cmd.len > 0 and cmd[0] != '-' and !isCommand(cmd)) {
-        try cmdAdd(allocator, args[1..]);
-        return;
-    }
-
-    // Special commands
-    if (std.mem.eql(u8, cmd, "init")) return cmdInit(allocator);
-    if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) return stdout().writeAll(USAGE);
-    if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
-        return stdout().print("dots {s} ({s})\n", .{ build_options.version, build_options.git_hash });
-    }
-
-    // Dispatch from table
     if (findCommand(cmd)) |handler| {
         try handler(allocator, args[2..]);
     } else {
+        // Quick add: dot "title"
         try cmdAdd(allocator, args[1..]);
     }
+}
+
+fn cmdInitWrapper(allocator: Allocator, _: []const []const u8) !void {
+    return cmdInit(allocator);
+}
+
+fn cmdHelp(_: Allocator, _: []const []const u8) !void {
+    return stdout().writeAll(USAGE);
+}
+
+fn cmdVersion(_: Allocator, _: []const []const u8) !void {
+    return stdout().print("dots {s} ({s})\n", .{ build_options.version, build_options.git_hash });
 }
 
 fn openStorage(allocator: Allocator) !sqlite.Storage {
