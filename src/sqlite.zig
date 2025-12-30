@@ -6,6 +6,7 @@ const c = @cImport({
 });
 
 // Use SQLITE_STATIC (null) since we always pass string slices that outlive statement execution
+const max_jsonl_bytes = 100 * 1024 * 1024;
 
 pub const SqliteError = error{
     OpenFailed,
@@ -68,6 +69,10 @@ pub const Db = struct {
     pub fn lastInsertRowId(self: Self) i64 {
         return c.sqlite3_last_insert_rowid(self.handle);
     }
+
+    pub fn changes(self: Self) c_int {
+        return c.sqlite3_changes(self.handle);
+    }
 };
 
 pub const Statement = struct {
@@ -86,7 +91,8 @@ pub const Statement = struct {
     }
 
     pub fn bindText(self: *Self, idx: c_int, text: []const u8) !void {
-        const rc = c.sqlite3_bind_text(self.handle, idx, text.ptr, @intCast(text.len), null);
+        const safe = if (text.len == 0) "" else text;
+        const rc = c.sqlite3_bind_text(self.handle, idx, safe.ptr, @intCast(safe.len), null);
         if (rc != c.SQLITE_OK) return SqliteError.BindFailed;
     }
 
@@ -201,6 +207,22 @@ pub fn freeIssues(allocator: Allocator, issues: []const Issue) void {
     allocator.free(issues);
 }
 
+pub const ChildIssue = struct {
+    issue: Issue,
+    blocked: bool,
+
+    pub fn deinit(self: *const ChildIssue, allocator: Allocator) void {
+        self.issue.deinit(allocator);
+    }
+};
+
+pub fn freeChildIssues(allocator: Allocator, issues: []const ChildIssue) void {
+    for (issues) |*issue| {
+        issue.deinit(allocator);
+    }
+    allocator.free(issues);
+}
+
 pub const Storage = struct {
     db: Db,
     allocator: Allocator,
@@ -212,7 +234,17 @@ pub const Storage = struct {
     get_by_id_stmt: Statement,
     list_stmt: Statement,
     add_dep_stmt: Statement,
-    get_blockers_stmt: Statement,
+    get_dep_type_stmt: Statement,
+    mark_dirty_stmt: Statement,
+    clear_dirty_stmt: Statement,
+    get_dirty_stmt: Statement,
+    get_ready_stmt: Statement,
+    get_children_stmt: Statement,
+    get_root_stmt: Statement,
+    search_stmt: Statement,
+    get_config_stmt: Statement,
+    set_config_stmt: Statement,
+    exists_stmt: Statement,
 
     const Self = @This();
 
@@ -254,7 +286,7 @@ pub const Storage = struct {
         var get_by_id_stmt = try db.prepare("SELECT id, title, description, status, priority, issue_type, assignee, created_at, updated_at, closed_at, close_reason FROM issues WHERE id = ?1");
         errdefer get_by_id_stmt.finalize();
 
-        var list_stmt = try db.prepare("SELECT id, title, description, status, priority, issue_type, assignee, created_at, updated_at, closed_at, close_reason FROM issues ORDER BY priority, created_at");
+        var list_stmt = try db.prepare("SELECT id, title, description, status, priority, issue_type, assignee, created_at, updated_at, closed_at, close_reason FROM issues WHERE (?1 IS NULL OR status = ?1) ORDER BY priority, created_at");
         errdefer list_stmt.finalize();
 
         var add_dep_stmt = try db.prepare(
@@ -262,10 +294,85 @@ pub const Storage = struct {
         );
         errdefer add_dep_stmt.finalize();
 
-        var get_blockers_stmt = try db.prepare(
-            "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 AND type = 'blocks'",
+        var get_dep_type_stmt = try db.prepare(
+            "SELECT type FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2",
         );
-        errdefer get_blockers_stmt.finalize();
+        errdefer get_dep_type_stmt.finalize();
+
+        var mark_dirty_stmt = try db.prepare(
+            "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES (?1, ?2)",
+        );
+        errdefer mark_dirty_stmt.finalize();
+
+        var clear_dirty_stmt = try db.prepare("DELETE FROM dirty_issues WHERE issue_id = ?1");
+        errdefer clear_dirty_stmt.finalize();
+
+        var get_dirty_stmt = try db.prepare("SELECT issue_id FROM dirty_issues ORDER BY marked_at");
+        errdefer get_dirty_stmt.finalize();
+
+        var get_ready_stmt = try db.prepare(
+            \\SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
+            \\       i.assignee, i.created_at, i.updated_at, i.closed_at, i.close_reason
+            \\FROM issues i
+            \\WHERE i.status = 'open'
+            \\  AND NOT EXISTS (
+            \\    SELECT 1 FROM dependencies d
+            \\    JOIN issues blocker ON d.depends_on_id = blocker.id
+            \\    WHERE d.issue_id = i.id
+            \\      AND d.type = 'blocks'
+            \\      AND blocker.status IN ('open', 'active', 'in_progress')
+            \\  )
+            \\ORDER BY i.priority, i.created_at
+        );
+        errdefer get_ready_stmt.finalize();
+
+        var get_children_stmt = try db.prepare(
+            \\SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
+            \\       i.assignee, i.created_at, i.updated_at, i.closed_at, i.close_reason,
+            \\       EXISTS (
+            \\         SELECT 1 FROM dependencies d2
+            \\         JOIN issues blocker ON d2.depends_on_id = blocker.id
+            \\         WHERE d2.issue_id = i.id
+            \\           AND d2.type = 'blocks'
+            \\           AND blocker.status IN ('open', 'active', 'in_progress')
+            \\       ) AS is_blocked
+            \\FROM issues i
+            \\JOIN dependencies d ON i.id = d.issue_id
+            \\WHERE d.depends_on_id = ?1 AND d.type = 'parent-child'
+            \\ORDER BY i.priority, i.created_at
+        );
+        errdefer get_children_stmt.finalize();
+
+        var get_root_stmt = try db.prepare(
+            \\SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
+            \\       i.assignee, i.created_at, i.updated_at, i.closed_at, i.close_reason
+            \\FROM issues i
+            \\WHERE i.status != 'closed'
+            \\  AND NOT EXISTS (
+            \\    SELECT 1 FROM dependencies d
+            \\    WHERE d.issue_id = i.id AND d.type = 'parent-child'
+            \\  )
+            \\ORDER BY i.priority, i.created_at
+        );
+        errdefer get_root_stmt.finalize();
+
+        var search_stmt = try db.prepare(
+            \\SELECT id, title, description, status, priority, issue_type,
+            \\       assignee, created_at, updated_at, closed_at, close_reason
+            \\FROM issues
+            \\WHERE title LIKE '%' || ?1 || '%' OR description LIKE '%' || ?1 || '%'
+            \\ORDER BY priority, created_at
+        );
+        errdefer search_stmt.finalize();
+
+        var get_config_stmt = try db.prepare("SELECT value FROM config WHERE key = ?1");
+        errdefer get_config_stmt.finalize();
+
+        var set_config_stmt = try db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)");
+        errdefer set_config_stmt.finalize();
+
+        var exists_stmt = try db.prepare("SELECT 1 FROM issues WHERE id = ?1");
+        errdefer exists_stmt.finalize();
 
         return Self{
             .db = db,
@@ -276,7 +383,17 @@ pub const Storage = struct {
             .get_by_id_stmt = get_by_id_stmt,
             .list_stmt = list_stmt,
             .add_dep_stmt = add_dep_stmt,
-            .get_blockers_stmt = get_blockers_stmt,
+            .get_dep_type_stmt = get_dep_type_stmt,
+            .mark_dirty_stmt = mark_dirty_stmt,
+            .clear_dirty_stmt = clear_dirty_stmt,
+            .get_dirty_stmt = get_dirty_stmt,
+            .get_ready_stmt = get_ready_stmt,
+            .get_children_stmt = get_children_stmt,
+            .get_root_stmt = get_root_stmt,
+            .search_stmt = search_stmt,
+            .get_config_stmt = get_config_stmt,
+            .set_config_stmt = set_config_stmt,
+            .exists_stmt = exists_stmt,
         };
     }
 
@@ -287,14 +404,31 @@ pub const Storage = struct {
         self.get_by_id_stmt.finalize();
         self.list_stmt.finalize();
         self.add_dep_stmt.finalize();
-        self.get_blockers_stmt.finalize();
+        self.get_dep_type_stmt.finalize();
+        self.mark_dirty_stmt.finalize();
+        self.clear_dirty_stmt.finalize();
+        self.get_dirty_stmt.finalize();
+        self.get_ready_stmt.finalize();
+        self.get_children_stmt.finalize();
+        self.get_root_stmt.finalize();
+        self.search_stmt.finalize();
+        self.get_config_stmt.finalize();
+        self.set_config_stmt.finalize();
+        self.exists_stmt.finalize();
         self.db.close();
     }
 
     pub fn createIssue(self: *Self, issue: Issue) !void {
         try self.db.exec("BEGIN TRANSACTION");
-        errdefer self.db.exec("ROLLBACK") catch {};
+        createIssueTransaction(self, issue) catch |err| {
+            self.db.exec("ROLLBACK") catch |rollback_err| {
+                std.debug.print("rollback failed: {}\n", .{rollback_err});
+            };
+            return err;
+        };
+    }
 
+    fn createIssueTransaction(self: *Self, issue: Issue) !void {
         self.insert_stmt.reset();
         try self.insert_stmt.bindText(1, issue.id);
         try self.insert_stmt.bindText(2, issue.title);
@@ -319,6 +453,8 @@ pub const Storage = struct {
     }
 
     pub fn updateStatus(self: *Self, id: []const u8, status: []const u8, updated_at: []const u8, closed_at: ?[]const u8, reason: ?[]const u8) !void {
+        if (!try self.issueExists(id)) return error.IssueNotFound;
+
         self.update_status_stmt.reset();
         try self.update_status_stmt.bindText(1, id);
         try self.update_status_stmt.bindText(2, status);
@@ -338,6 +474,8 @@ pub const Storage = struct {
     }
 
     pub fn deleteIssue(self: *Self, id: []const u8) !void {
+        if (!try self.issueExists(id)) return error.IssueNotFound;
+
         self.delete_stmt.reset();
         try self.delete_stmt.bindText(1, id);
         _ = try self.delete_stmt.step();
@@ -352,48 +490,7 @@ pub const Storage = struct {
         return null;
     }
 
-    pub fn listIssues(self: *Self, status_filter: ?[]const u8) ![]Issue {
-        var issues: std.ArrayList(Issue) = .empty;
-        errdefer {
-            for (issues.items) |*iss| iss.deinit(self.allocator);
-            issues.deinit(self.allocator);
-        }
-
-        self.list_stmt.reset();
-        while (try self.list_stmt.step()) {
-            const issue = try self.rowToIssue(&self.list_stmt);
-            if (status_filter) |filter| {
-                if (!std.mem.eql(u8, issue.status, filter)) {
-                    issue.deinit(self.allocator);
-                    continue;
-                }
-            }
-            try issues.append(self.allocator, issue);
-        }
-
-        return issues.toOwnedSlice(self.allocator);
-    }
-
-    pub fn getReadyIssues(self: *Self) ![]Issue {
-        // Get all open issues that have no open blockers
-        const sql =
-            \\SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
-            \\       i.assignee, i.created_at, i.updated_at, i.closed_at, i.close_reason
-            \\FROM issues i
-            \\WHERE i.status = 'open'
-            \\  AND NOT EXISTS (
-            \\    SELECT 1 FROM dependencies d
-            \\    JOIN issues blocker ON d.depends_on_id = blocker.id
-            \\    WHERE d.issue_id = i.id
-            \\      AND d.type = 'blocks'
-            \\      AND blocker.status IN ('open', 'active', 'in_progress')
-            \\  )
-            \\ORDER BY i.priority, i.created_at
-        ;
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-
+    fn collectIssues(self: *Self, stmt: *Statement) ![]Issue {
         var issues: std.ArrayList(Issue) = .empty;
         errdefer {
             for (issues.items) |*iss| iss.deinit(self.allocator);
@@ -401,10 +498,29 @@ pub const Storage = struct {
         }
 
         while (try stmt.step()) {
-            try issues.append(self.allocator, try self.rowToIssue(&stmt));
+            const issue = try self.rowToIssue(stmt);
+            issues.append(self.allocator, issue) catch |err| {
+                issue.deinit(self.allocator);
+                return err;
+            };
         }
 
         return issues.toOwnedSlice(self.allocator);
+    }
+
+    pub fn listIssues(self: *Self, status_filter: ?[]const u8) ![]Issue {
+        self.list_stmt.reset();
+        if (status_filter) |filter| {
+            try self.list_stmt.bindText(1, filter);
+        } else {
+            try self.list_stmt.bindNull(1);
+        }
+        return try self.collectIssues(&self.list_stmt);
+    }
+
+    pub fn getReadyIssues(self: *Self) ![]Issue {
+        self.get_ready_stmt.reset();
+        return try self.collectIssues(&self.get_ready_stmt);
     }
 
     fn rowToIssue(self: *Self, stmt: *Statement) !Issue {
@@ -459,7 +575,22 @@ pub const Storage = struct {
         return self.allocator.dupe(u8, text);
     }
 
+    fn issueExists(self: *Self, id: []const u8) !bool {
+        self.exists_stmt.reset();
+        try self.exists_stmt.bindText(1, id);
+        return try self.exists_stmt.step();
+    }
+
     pub fn addDependency(self: *Self, issue_id: []const u8, depends_on_id: []const u8, dep_type: []const u8, created_at: []const u8) !void {
+        self.get_dep_type_stmt.reset();
+        try self.get_dep_type_stmt.bindText(1, issue_id);
+        try self.get_dep_type_stmt.bindText(2, depends_on_id);
+        if (try self.get_dep_type_stmt.step()) {
+            const existing = self.get_dep_type_stmt.columnText(0) orelse "";
+            if (!std.mem.eql(u8, existing, dep_type)) return error.DependencyConflict;
+            return;
+        }
+
         self.add_dep_stmt.reset();
         try self.add_dep_stmt.bindText(1, issue_id);
         try self.add_dep_stmt.bindText(2, depends_on_id);
@@ -470,27 +601,27 @@ pub const Storage = struct {
     }
 
     pub fn markDirty(self: *Self, issue_id: []const u8, marked_at: []const u8) !void {
-        const sql = "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES (?1, ?2)";
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-        try stmt.bindText(1, issue_id);
-        try stmt.bindText(2, marked_at);
-        _ = try stmt.step();
+        self.mark_dirty_stmt.reset();
+        try self.mark_dirty_stmt.bindText(1, issue_id);
+        try self.mark_dirty_stmt.bindText(2, marked_at);
+        _ = try self.mark_dirty_stmt.step();
     }
 
     pub fn getDirtyIssues(self: *Self) ![][]const u8 {
-        var stmt = try self.db.prepare("SELECT issue_id FROM dirty_issues ORDER BY marked_at");
-        defer stmt.finalize();
-
         var ids: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (ids.items) |id| self.allocator.free(id);
             ids.deinit(self.allocator);
         }
 
-        while (try stmt.step()) {
-            if (stmt.columnText(0)) |id| {
-                try ids.append(self.allocator, try self.allocator.dupe(u8, id));
+        self.get_dirty_stmt.reset();
+        while (try self.get_dirty_stmt.step()) {
+            if (self.get_dirty_stmt.columnText(0)) |id| {
+                const duped = try self.allocator.dupe(u8, id);
+                ids.append(self.allocator, duped) catch |err| {
+                    self.allocator.free(duped);
+                    return err;
+                };
             }
         }
 
@@ -498,39 +629,30 @@ pub const Storage = struct {
     }
 
     pub fn clearDirty(self: *Self, issue_ids: []const []const u8) !void {
-        var stmt = try self.db.prepare("DELETE FROM dirty_issues WHERE issue_id = ?1");
-        defer stmt.finalize();
-
         for (issue_ids) |id| {
-            stmt.reset();
-            try stmt.bindText(1, id);
-            _ = try stmt.step();
+            self.clear_dirty_stmt.reset();
+            try self.clear_dirty_stmt.bindText(1, id);
+            _ = try self.clear_dirty_stmt.step();
         }
     }
 
     // Get children for tree view
-    pub fn getChildren(self: *Self, parent_id: []const u8) ![]Issue {
-        const sql =
-            \\SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
-            \\       i.assignee, i.created_at, i.updated_at, i.closed_at, i.close_reason
-            \\FROM issues i
-            \\JOIN dependencies d ON i.id = d.issue_id
-            \\WHERE d.depends_on_id = ?1 AND d.type = 'parent-child'
-            \\ORDER BY i.priority, i.created_at
-        ;
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-        try stmt.bindText(1, parent_id);
-
-        var issues: std.ArrayList(Issue) = .empty;
+    pub fn getChildren(self: *Self, parent_id: []const u8) ![]ChildIssue {
+        var issues: std.ArrayList(ChildIssue) = .empty;
         errdefer {
             for (issues.items) |*iss| iss.deinit(self.allocator);
             issues.deinit(self.allocator);
         }
 
-        while (try stmt.step()) {
-            try issues.append(self.allocator, try self.rowToIssue(&stmt));
+        self.get_children_stmt.reset();
+        try self.get_children_stmt.bindText(1, parent_id);
+        while (try self.get_children_stmt.step()) {
+            const issue = try self.rowToIssue(&self.get_children_stmt);
+            const blocked = self.get_children_stmt.columnInt(11) != 0;
+            issues.append(self.allocator, .{ .issue = issue, .blocked = blocked }) catch |err| {
+                issue.deinit(self.allocator);
+                return err;
+            };
         }
 
         return issues.toOwnedSlice(self.allocator);
@@ -538,85 +660,23 @@ pub const Storage = struct {
 
     // Get root issues (no parent) for tree view
     pub fn getRootIssues(self: *Self) ![]Issue {
-        const sql =
-            \\SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
-            \\       i.assignee, i.created_at, i.updated_at, i.closed_at, i.close_reason
-            \\FROM issues i
-            \\WHERE i.status != 'closed'
-            \\  AND NOT EXISTS (
-            \\    SELECT 1 FROM dependencies d
-            \\    WHERE d.issue_id = i.id AND d.type = 'parent-child'
-            \\  )
-            \\ORDER BY i.priority, i.created_at
-        ;
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-
-        var issues: std.ArrayList(Issue) = .empty;
-        errdefer {
-            for (issues.items) |*iss| iss.deinit(self.allocator);
-            issues.deinit(self.allocator);
-        }
-
-        while (try stmt.step()) {
-            try issues.append(self.allocator, try self.rowToIssue(&stmt));
-        }
-
-        return issues.toOwnedSlice(self.allocator);
-    }
-
-    // Check if issue is blocked
-    pub fn isBlocked(self: *Self, issue_id: []const u8) !bool {
-        const sql =
-            \\SELECT 1 FROM dependencies d
-            \\JOIN issues blocker ON d.depends_on_id = blocker.id
-            \\WHERE d.issue_id = ?1
-            \\  AND d.type = 'blocks'
-            \\  AND blocker.status IN ('open', 'active', 'in_progress')
-            \\LIMIT 1
-        ;
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-        try stmt.bindText(1, issue_id);
-        return try stmt.step();
+        self.get_root_stmt.reset();
+        return try self.collectIssues(&self.get_root_stmt);
     }
 
     // Search issues
     pub fn searchIssues(self: *Self, query: []const u8) ![]Issue {
-        const sql =
-            \\SELECT id, title, description, status, priority, issue_type,
-            \\       assignee, created_at, updated_at, closed_at, close_reason
-            \\FROM issues
-            \\WHERE title LIKE '%' || ?1 || '%' OR description LIKE '%' || ?1 || '%'
-            \\ORDER BY priority, created_at
-        ;
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-        try stmt.bindText(1, query);
-
-        var issues: std.ArrayList(Issue) = .empty;
-        errdefer {
-            for (issues.items) |*iss| iss.deinit(self.allocator);
-            issues.deinit(self.allocator);
-        }
-
-        while (try stmt.step()) {
-            try issues.append(self.allocator, try self.rowToIssue(&stmt));
-        }
-
-        return issues.toOwnedSlice(self.allocator);
+        self.search_stmt.reset();
+        try self.search_stmt.bindText(1, query);
+        return try self.collectIssues(&self.search_stmt);
     }
 
     // Get config value from config table
     pub fn getConfig(self: *Self, key: []const u8) !?[]const u8 {
-        var stmt = try self.db.prepare("SELECT value FROM config WHERE key = ?1");
-        defer stmt.finalize();
-        try stmt.bindText(1, key);
-        if (try stmt.step()) {
-            if (stmt.columnText(0)) |value| {
+        self.get_config_stmt.reset();
+        try self.get_config_stmt.bindText(1, key);
+        if (try self.get_config_stmt.step()) {
+            if (self.get_config_stmt.columnText(0)) |value| {
                 return try self.allocator.dupe(u8, value);
             }
         }
@@ -625,13 +685,19 @@ pub const Storage = struct {
 
     // Set config value in config table
     pub fn setConfig(self: *Self, key: []const u8, value: []const u8) !void {
-        var stmt = try self.db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)");
-        defer stmt.finalize();
-        try stmt.bindText(1, key);
-        try stmt.bindText(2, value);
-        _ = try stmt.step();
+        self.set_config_stmt.reset();
+        try self.set_config_stmt.bindText(1, key);
+        try self.set_config_stmt.bindText(2, value);
+        _ = try self.set_config_stmt.step();
     }
 };
+
+fn normalizeJsonlStatus(status_raw: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, status_raw, "open")) return "open";
+    if (std.mem.eql(u8, status_raw, "active") or std.mem.eql(u8, status_raw, "in_progress")) return "active";
+    if (std.mem.eql(u8, status_raw, "closed") or std.mem.eql(u8, status_raw, "done")) return "closed";
+    return error.InvalidStatus;
+}
 
 // Hydrate from beads JSONL
 pub fn hydrateFromJsonl(storage: *Storage, allocator: Allocator, jsonl_path: []const u8) !usize {
@@ -641,35 +707,60 @@ pub fn hydrateFromJsonl(storage: *Storage, allocator: Allocator, jsonl_path: []c
     };
     defer file.close();
 
-    const content = try file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    const content = try file.readToEndAlloc(allocator, max_jsonl_bytes);
     defer allocator.free(content);
 
     var count: usize = 0;
     var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var line_no: usize = 0;
 
-    while (line_iter.next()) |line| {
+    const JsonlDependency = struct {
+        depends_on_id: []const u8,
+        type: ?[]const u8 = null,
+    };
+
+    const JsonlIssue = struct {
+        id: []const u8,
+        title: []const u8,
+        description: ?[]const u8 = null,
+        status: []const u8,
+        priority: i64,
+        issue_type: []const u8,
+        assignee: ?[]const u8 = null,
+        created_at: []const u8,
+        updated_at: []const u8,
+        closed_at: ?[]const u8 = null,
+        close_reason: ?[]const u8 = null,
+        dependencies: ?[]const JsonlDependency = null,
+    };
+
+    while (line_iter.next()) |line| : (line_no += 1) {
         if (line.len == 0) continue;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        const parsed = std.json.parseFromSlice(JsonlIssue, allocator, line, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.debug.print("Invalid JSON at {s}:{d}\n", .{ jsonl_path, line_no + 1 });
+            return err;
+        };
         defer parsed.deinit();
 
-        if (parsed.value != .object) continue;
-        const obj = parsed.value.object;
+        const obj = parsed.value;
 
         // Map beads fields to our schema
-        const id = if (obj.get("id")) |v| (if (v == .string) v.string else continue) else continue;
-        const title = if (obj.get("title")) |v| (if (v == .string) v.string else continue) else continue;
-        const description = if (obj.get("description")) |v| (if (v == .string) v.string else "") else "";
-        const status_raw = if (obj.get("status")) |v| (if (v == .string) v.string else "open") else "open";
-        const priority: i64 = if (obj.get("priority")) |v| (if (v == .integer) v.integer else 2) else 2;
-        const issue_type = if (obj.get("issue_type")) |v| (if (v == .string) v.string else "task") else "task";
-        const created_at = if (obj.get("created_at")) |v| (if (v == .string) v.string else "") else "";
-        const updated_at = if (obj.get("updated_at")) |v| (if (v == .string) v.string else created_at) else created_at;
-        const closed_at = if (obj.get("closed_at")) |v| (if (v == .string) v.string else null) else null;
-        const close_reason = if (obj.get("close_reason")) |v| (if (v == .string) v.string else null) else null;
+        const id = obj.id;
+        const title = obj.title;
+        const description = obj.description orelse "";
+        const status_raw = obj.status;
+        const priority: i64 = obj.priority;
+        const issue_type = obj.issue_type;
+        const created_at = obj.created_at;
+        const updated_at = obj.updated_at;
+        const closed_at = obj.closed_at;
+        const close_reason = obj.close_reason;
 
         // Map beads status to dots status (in_progress -> active, keep closed as-is)
-        const status = if (std.mem.eql(u8, status_raw, "in_progress")) "active" else status_raw;
+        const status = normalizeJsonlStatus(status_raw) catch |err| switch (err) {
+            error.InvalidStatus => return error.InvalidJsonl,
+        };
 
         const issue = Issue{
             .id = id,
@@ -678,7 +769,7 @@ pub fn hydrateFromJsonl(storage: *Storage, allocator: Allocator, jsonl_path: []c
             .status = status,
             .priority = priority,
             .issue_type = issue_type,
-            .assignee = if (obj.get("assignee")) |v| (if (v == .string) v.string else null) else null,
+            .assignee = obj.assignee,
             .created_at = created_at,
             .updated_at = updated_at,
             .closed_at = closed_at,
@@ -687,18 +778,21 @@ pub fn hydrateFromJsonl(storage: *Storage, allocator: Allocator, jsonl_path: []c
             .parent = null,
         };
 
-        storage.createIssue(issue) catch continue;
+        try storage.createIssue(issue);
 
-        // Handle dependencies (only if it's a valid array)
-        if (obj.get("dependencies")) |deps_val| {
-            if (deps_val == .array) {
-                for (deps_val.array.items) |dep| {
-                    if (dep != .object) continue;
-                    const dep_obj = dep.object;
-                    const depends_on_id = if (dep_obj.get("depends_on_id")) |v| (if (v == .string) v.string else continue) else continue;
-                    const dep_type = if (dep_obj.get("type")) |v| (if (v == .string) v.string else "blocks") else "blocks";
-                    storage.addDependency(id, depends_on_id, dep_type, created_at) catch continue;
-                }
+        if (obj.dependencies) |deps| {
+            for (deps) |dep| {
+                const dep_type = dep.type orelse "blocks";
+                storage.addDependency(id, dep.depends_on_id, dep_type, created_at) catch |err| switch (err) {
+                    error.DependencyConflict => {
+                        std.debug.print(
+                            "Invalid dependency at {s}:{d} for {s} -> {s}\n",
+                            .{ jsonl_path, line_no + 1, id, dep.depends_on_id },
+                        );
+                        return error.InvalidJsonl;
+                    },
+                    else => return err,
+                };
             }
         }
 

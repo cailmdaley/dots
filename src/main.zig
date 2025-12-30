@@ -3,6 +3,8 @@ const fs = std.fs;
 const Allocator = std.mem.Allocator;
 const sqlite = @import("sqlite.zig");
 const build_options = @import("build_options");
+const status_util = @import("util/status.zig");
+const mapping_util = @import("util/mapping.zig");
 
 const libc = @cImport({
     @cInclude("time.h");
@@ -11,6 +13,9 @@ const libc = @cImport({
 const BEADS_DIR = ".beads";
 const BEADS_DB = ".beads/beads.db";
 const BEADS_JSONL = ".beads/issues.jsonl";
+const max_hook_input_bytes = 1024 * 1024;
+const max_mapping_bytes = 1024 * 1024;
+const default_priority: i64 = 2;
 
 // Command dispatch table
 const Handler = *const fn (Allocator, []const []const u8) anyerror!void;
@@ -53,16 +58,18 @@ pub fn main() !void {
 
     if (args.len < 2) {
         try cmdReady(allocator, &.{"--json"});
-        return;
+    } else {
+        const cmd = args[1];
+        if (findCommand(cmd)) |handler| {
+            try handler(allocator, args[2..]);
+        } else {
+            // Quick add: dot "title"
+            try cmdAdd(allocator, args[1..]);
+        }
     }
 
-    const cmd = args[1];
-
-    if (findCommand(cmd)) |handler| {
-        try handler(allocator, args[2..]);
-    } else {
-        // Quick add: dot "title"
-        try cmdAdd(allocator, args[1..]);
+    if (stdout_writer) |*writer| {
+        try writer.interface.flush();
     }
 }
 
@@ -92,41 +99,50 @@ fn openStorage(allocator: Allocator) !sqlite.Storage {
 }
 
 // I/O helpers
-const Writer = std.io.GenericWriter(void, anyerror, struct {
-    fn write(_: void, bytes: []const u8) !usize {
-        return fs.File.stdout().write(bytes);
-    }
-}.write);
+var stdout_buffer: [4096]u8 = undefined;
+var stdout_writer: ?fs.File.Writer = null;
 
-fn stdout() Writer {
-    return .{ .context = {} };
+fn stdout() *std.Io.Writer {
+    if (stdout_writer == null) {
+        stdout_writer = fs.File.stdout().writer(&stdout_buffer);
+    }
+    return &stdout_writer.?.interface;
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
-    _ = fs.File.stderr().write(msg) catch {};
+    std.debug.print(fmt, args);
     std.process.exit(1);
 }
 
 // Status helpers
+const StatusKind = status_util.StatusKind;
+
+fn statusKindOrFatal(status_str: []const u8) StatusKind {
+    return status_util.parse(status_str) orelse fatal("Invalid status: {s}\n", .{status_str});
+}
+
+fn statusToString(kind: StatusKind) []const u8 {
+    return status_util.toString(kind);
+}
+
+fn parseStatusArg(status: []const u8) []const u8 {
+    return statusToString(statusKindOrFatal(status));
+}
+
 fn statusChar(status: []const u8) u8 {
-    return if (std.mem.eql(u8, status, "open")) 'o' else if (std.mem.eql(u8, status, "active")) '>' else 'x';
+    return status_util.char(statusKindOrFatal(status));
 }
 
 fn statusSym(status: []const u8) []const u8 {
-    return if (std.mem.eql(u8, status, "open")) "○" else if (std.mem.eql(u8, status, "active")) "●" else "✓";
+    return status_util.symbol(statusKindOrFatal(status));
 }
 
-fn mapStatus(s: []const u8) []const u8 {
-    if (std.mem.eql(u8, s, "in_progress")) return "active";
-    if (std.mem.eql(u8, s, "done")) return "closed";
-    return s;
+fn displayStatus(status: []const u8) []const u8 {
+    return status_util.display(statusKindOrFatal(status));
 }
 
-fn displayStatus(s: []const u8) []const u8 {
-    if (std.mem.eql(u8, s, "closed")) return "done";
-    return s;
+fn isClosedStatus(status: []const u8) bool {
+    return statusKindOrFatal(status) == .closed;
 }
 
 // Arg parsing helper
@@ -179,7 +195,10 @@ fn cmdInit(allocator: Allocator) !void {
     };
 
     const jsonl_exists = blk: {
-        fs.cwd().access(BEADS_JSONL, .{}) catch break :blk false;
+        fs.cwd().access(BEADS_JSONL, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
         break :blk true;
     };
 
@@ -197,7 +216,7 @@ fn cmdAdd(allocator: Allocator, args: []const []const u8) !void {
 
     var title: []const u8 = "";
     var description: []const u8 = "";
-    var priority: i64 = 2;
+    var priority: i64 = default_priority;
     var parent: ?[]const u8 = null;
     var after: ?[]const u8 = null;
 
@@ -217,6 +236,9 @@ fn cmdAdd(allocator: Allocator, args: []const []const u8) !void {
     }
 
     if (title.len == 0) fatal("Error: title required\n", .{});
+    if (parent != null and after != null and std.mem.eql(u8, parent.?, after.?)) {
+        fatal("Error: parent and after cannot be the same issue\n", .{});
+    }
 
     var storage = try openStorage(allocator);
     defer storage.close();
@@ -250,7 +272,7 @@ fn cmdAdd(allocator: Allocator, args: []const []const u8) !void {
 
     const w = stdout();
     if (hasFlag(args, "--json")) {
-        try writeIssueJson(allocator, issue, w);
+        try writeIssueJson(issue, w);
         try w.writeByte('\n');
     } else {
         try w.print("{s}\n", .{id});
@@ -261,7 +283,7 @@ fn cmdList(allocator: Allocator, args: []const []const u8) !void {
     var filter_status: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (getArg(args, &i, "--status")) |v| filter_status = mapStatus(v);
+        if (getArg(args, &i, "--status")) |v| filter_status = parseStatusArg(v);
     }
 
     var storage = try openStorage(allocator);
@@ -270,7 +292,7 @@ fn cmdList(allocator: Allocator, args: []const []const u8) !void {
     const issues = try storage.listIssues(filter_status);
     defer sqlite.freeIssues(allocator, issues);
 
-    try writeIssueList(allocator, issues, filter_status == null, hasFlag(args, "--json"));
+    try writeIssueList(issues, filter_status == null, hasFlag(args, "--json"));
 }
 
 fn cmdReady(allocator: Allocator, args: []const []const u8) !void {
@@ -280,24 +302,24 @@ fn cmdReady(allocator: Allocator, args: []const []const u8) !void {
     const issues = try storage.getReadyIssues();
     defer sqlite.freeIssues(allocator, issues);
 
-    try writeIssueList(allocator, issues, false, hasFlag(args, "--json"));
+    try writeIssueList(issues, false, hasFlag(args, "--json"));
 }
 
-fn writeIssueList(allocator: Allocator, issues: []const sqlite.Issue, skip_done: bool, use_json: bool) !void {
+fn writeIssueList(issues: []const sqlite.Issue, skip_done: bool, use_json: bool) !void {
     const w = stdout();
     if (use_json) {
         try w.writeByte('[');
         var first = true;
         for (issues) |issue| {
-            if (skip_done and std.mem.eql(u8, issue.status, "closed")) continue;
+            if (skip_done and isClosedStatus(issue.status)) continue;
             if (!first) try w.writeByte(',');
             first = false;
-            try writeIssueJson(allocator, issue, w);
+            try writeIssueJson(issue, w);
         }
         try w.writeAll("]\n");
     } else {
         for (issues) |issue| {
-            if (skip_done and std.mem.eql(u8, issue.status, "closed")) continue;
+            if (skip_done and isClosedStatus(issue.status)) continue;
             try w.print("[{s}] {c} {s}\n", .{ issue.id, statusChar(issue.status), issue.title });
         }
     }
@@ -312,7 +334,10 @@ fn cmdOn(allocator: Allocator, args: []const []const u8) !void {
     var storage = try openStorage(allocator);
     defer storage.close();
 
-    try storage.updateStatus(args[0], "active", now, null, null);
+    storage.updateStatus(args[0], "active", now, null, null) catch |err| switch (err) {
+        error.IssueNotFound => fatal("Issue not found: {s}\n", .{args[0]}),
+        else => return err,
+    };
 }
 
 fn cmdOff(allocator: Allocator, args: []const []const u8) !void {
@@ -330,7 +355,10 @@ fn cmdOff(allocator: Allocator, args: []const []const u8) !void {
     var storage = try openStorage(allocator);
     defer storage.close();
 
-    try storage.updateStatus(args[0], "closed", now, now, reason);
+    storage.updateStatus(args[0], "closed", now, now, reason) catch |err| switch (err) {
+        error.IssueNotFound => fatal("Issue not found: {s}\n", .{args[0]}),
+        else => return err,
+    };
 }
 
 fn cmdRm(allocator: Allocator, args: []const []const u8) !void {
@@ -339,7 +367,10 @@ fn cmdRm(allocator: Allocator, args: []const []const u8) !void {
     var storage = try openStorage(allocator);
     defer storage.close();
 
-    try storage.deleteIssue(args[0]);
+    storage.deleteIssue(args[0]) catch |err| switch (err) {
+        error.IssueNotFound => fatal("Issue not found: {s}\n", .{args[0]}),
+        else => return err,
+    };
 }
 
 fn cmdShow(allocator: Allocator, args: []const []const u8) !void {
@@ -373,11 +404,14 @@ fn cmdTree(allocator: Allocator, args: []const []const u8) !void {
         try w.print("[{s}] {s} {s}\n", .{ root.id, statusSym(root.status), root.title });
 
         const children = try storage.getChildren(root.id);
-        defer sqlite.freeIssues(allocator, children);
+        defer sqlite.freeChildIssues(allocator, children);
 
         for (children) |child| {
-            const blocked_msg: []const u8 = if (try storage.isBlocked(child.id)) " (blocked)" else "";
-            try w.print("  └─ [{s}] {s} {s}{s}\n", .{ child.id, statusSym(child.status), child.title, blocked_msg });
+            const blocked_msg: []const u8 = if (child.blocked) " (blocked)" else "";
+            try w.print(
+                "  └─ [{s}] {s} {s}{s}\n",
+                .{ child.issue.id, statusSym(child.issue.status), child.issue.title, blocked_msg },
+            );
         }
     }
 }
@@ -403,7 +437,7 @@ fn cmdBeadsUpdate(allocator: Allocator, args: []const []const u8) !void {
     var new_status: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (getArg(args, &i, "--status")) |v| new_status = mapStatus(v);
+        if (getArg(args, &i, "--status")) |v| new_status = parseStatusArg(v);
     }
 
     const status = new_status orelse fatal("--status required\n", .{});
@@ -414,7 +448,11 @@ fn cmdBeadsUpdate(allocator: Allocator, args: []const []const u8) !void {
     var storage = try openStorage(allocator);
     defer storage.close();
 
-    try storage.updateStatus(args[0], status, now, null, null);
+    const closed_at: ?[]const u8 = if (std.mem.eql(u8, status, "closed")) now else null;
+    storage.updateStatus(args[0], status, now, closed_at, null) catch |err| switch (err) {
+        error.IssueNotFound => fatal("Issue not found: {s}\n", .{args[0]}),
+        else => return err,
+    };
 }
 
 fn cmdBeadsClose(allocator: Allocator, args: []const []const u8) !void {
@@ -432,7 +470,10 @@ fn cmdBeadsClose(allocator: Allocator, args: []const []const u8) !void {
     var storage = try openStorage(allocator);
     defer storage.close();
 
-    try storage.updateStatus(args[0], "closed", now, now, reason);
+    storage.updateStatus(args[0], "closed", now, now, reason) catch |err| switch (err) {
+        error.IssueNotFound => fatal("Issue not found: {s}\n", .{args[0]}),
+        else => return err,
+    };
 }
 
 fn generateId(allocator: Allocator, prefix: []const u8) ![]u8 {
@@ -453,12 +494,7 @@ fn getOrCreatePrefix(allocator: Allocator, storage: *sqlite.Storage) ![]const u8
     // Auto-detect from directory name (like beads does)
     const cwd = std.fs.cwd();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = cwd.realpath(".", &path_buf) catch {
-        // Fallback if realpath fails - store it so we don't retry
-        const fallback = "dot";
-        try storage.setConfig("issue_prefix", fallback);
-        return allocator.dupe(u8, fallback);
-    };
+    const path = try cwd.realpath(".", &path_buf);
     const basename = std.fs.path.basename(path);
 
     // Strip trailing hyphens like beads does
@@ -480,8 +516,7 @@ fn formatTimestamp(buf: []u8) ![]const u8 {
 
     var tm: libc.struct_tm = undefined;
     if (libc.localtime_r(&epoch_secs, &tm) == null) {
-        // Fallback to UTC epoch on failure
-        return std.fmt.bufPrint(buf, "1970-01-01T00:00:00.000000+00:00", .{});
+        return error.LocaltimeFailed;
     }
 
     const year: u64 = @intCast(tm.tm_year + 1900);
@@ -515,7 +550,7 @@ const JsonIssue = struct {
     close_reason: ?[]const u8 = null,
 };
 
-fn writeIssueJson(allocator: Allocator, issue: sqlite.Issue, w: Writer) !void {
+fn writeIssueJson(issue: sqlite.Issue, w: *std.Io.Writer) !void {
     const json_issue = JsonIssue{
         .id = issue.id,
         .title = issue.title,
@@ -528,9 +563,7 @@ fn writeIssueJson(allocator: Allocator, issue: sqlite.Issue, w: Writer) !void {
         .closed_at = issue.closed_at,
         .close_reason = issue.close_reason,
     };
-    const json = try std.json.Stringify.valueAlloc(allocator, json_issue, .{});
-    defer allocator.free(json);
-    try w.writeAll(json);
+    try std.json.Stringify.value(json_issue, .{}, w);
 }
 
 // Claude Code hook handlers
@@ -548,15 +581,18 @@ fn cmdHook(allocator: Allocator, args: []const []const u8) !void {
 
 fn hookSession(allocator: Allocator) !void {
     // Check if .beads exists
-    fs.cwd().access(BEADS_DIR, .{}) catch return;
+    fs.cwd().access(BEADS_DIR, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
 
-    var storage = openStorage(allocator) catch return;
+    var storage = try openStorage(allocator);
     defer storage.close();
 
-    const active = storage.listIssues("active") catch return;
+    const active = try storage.listIssues("active");
     defer sqlite.freeIssues(allocator, active);
 
-    const ready = storage.getReadyIssues() catch return;
+    const ready = try storage.getReadyIssues();
     defer sqlite.freeIssues(allocator, ready);
 
     if (active.len == 0 and ready.len == 0) return;
@@ -574,78 +610,123 @@ fn hookSession(allocator: Allocator) !void {
 }
 
 const MAPPING_FILE = ".beads/todo-mapping.json";
+const Mapping = mapping_util.Mapping;
+
+const HookEnvelope = struct {
+    tool_name: []const u8,
+    tool_input: ?std.json.Value = null,
+};
+
+const HookTodoInput = struct {
+    todos: []const HookTodo,
+};
+
+const HookTodo = struct {
+    content: []const u8,
+    status: []const u8,
+    activeForm: ?[]const u8 = null,
+};
+
+fn parseJsonSliceOrError(
+    comptime T: type,
+    allocator: Allocator,
+    input: []const u8,
+    invalid_err: anyerror,
+    options: std.json.ParseOptions,
+) !std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, input, options) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return invalid_err,
+    };
+}
+
+fn parseJsonValueOrError(
+    comptime T: type,
+    allocator: Allocator,
+    input: std.json.Value,
+    invalid_err: anyerror,
+    options: std.json.ParseOptions,
+) !std.json.Parsed(T) {
+    return std.json.parseFromValue(T, allocator, input, options) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return invalid_err,
+    };
+}
+
+fn validateHookStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "pending") or std.mem.eql(u8, status, "in_progress") or std.mem.eql(u8, status, "completed");
+}
 
 fn hookSync(allocator: Allocator) !void {
     // Read stdin
-    const input = fs.File.stdin().readToEndAlloc(allocator, 1024 * 1024) catch return;
+    const input = try fs.File.stdin().readToEndAlloc(allocator, max_hook_input_bytes);
     defer allocator.free(input);
+    if (input.len == 0) return error.EmptyHookInput;
 
     // Parse JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch return;
+    const parsed = try parseJsonSliceOrError(
+        HookEnvelope,
+        allocator,
+        input,
+        error.InvalidHookInput,
+        .{ .ignore_unknown_fields = false },
+    );
     defer parsed.deinit();
 
-    if (parsed.value != .object) return;
-    const root = parsed.value.object;
+    if (!std.mem.eql(u8, parsed.value.tool_name, "TodoWrite")) return;
+    const tool_input = parsed.value.tool_input orelse return error.InvalidHookInput;
 
-    // Check if TodoWrite
-    const tool_name = root.get("tool_name") orelse return;
-    if (tool_name != .string or !std.mem.eql(u8, tool_name.string, "TodoWrite")) return;
-
-    const tool_input = root.get("tool_input") orelse return;
-    if (tool_input != .object) return;
-
-    const todos = tool_input.object.get("todos") orelse return;
-    if (todos != .array) return;
+    const parsed_input = try parseJsonValueOrError(
+        HookTodoInput,
+        allocator,
+        tool_input,
+        error.InvalidHookInput,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed_input.deinit();
+    const todos = parsed_input.value.todos;
 
     // Ensure .beads exists
     fs.cwd().makeDir(BEADS_DIR) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => return,
+        else => return err,
     };
 
-    var storage = openStorage(allocator) catch return;
+    var storage = try openStorage(allocator);
     defer storage.close();
 
     // Get prefix for ID generation
-    const prefix = getOrCreatePrefix(allocator, &storage) catch return;
+    const prefix = try getOrCreatePrefix(allocator, &storage);
     defer allocator.free(prefix);
 
     // Load mapping
-    var mapping = loadMapping(allocator);
-    defer {
-        var it = mapping.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        mapping.deinit();
-    }
+    var mapping = try loadMapping(allocator);
+    defer mapping_util.deinit(allocator, &mapping);
 
     var ts_buf: [40]u8 = undefined;
-    const now = formatTimestamp(&ts_buf) catch return;
+    const now = try formatTimestamp(&ts_buf);
 
     // Process todos
-    for (todos.array.items) |todo_val| {
-        if (todo_val != .object) continue;
-        const todo = todo_val.object;
-
-        const content = if (todo.get("content")) |v| (if (v == .string) v.string else continue) else continue;
-        const status = if (todo.get("status")) |v| (if (v == .string) v.string else "pending") else "pending";
+    for (todos) |todo| {
+        const content = todo.content;
+        const status = todo.status;
+        if (content.len == 0) return error.InvalidHookInput;
+        if (!validateHookStatus(status)) return error.InvalidHookInput;
 
         if (std.mem.eql(u8, status, "completed")) {
             // Mark as done if we have mapping - only remove on success
-            if (mapping.get(content)) |dot_id| {
-                storage.updateStatus(dot_id, "closed", now, now, "Completed via TodoWrite") catch continue;
-                if (mapping.fetchRemove(content)) |kv| {
-                    allocator.free(kv.key);
-                    allocator.free(kv.value);
-                }
+            const dot_id = mapping.map.get(content) orelse return error.MissingTodoMapping;
+            try storage.updateStatus(dot_id, "closed", now, now, "Completed via TodoWrite");
+            if (mapping.map.fetchOrderedRemove(content)) |kv| {
+                allocator.free(kv.key);
+                allocator.free(kv.value);
             }
-        } else if (mapping.get(content) == null) {
+        } else if (mapping.map.get(content) == null) {
             // Create new dot
-            const id = generateId(allocator, prefix) catch continue;
-            const desc = if (todo.get("activeForm")) |v| (if (v == .string) v.string else "") else "";
-            const priority: i64 = if (std.mem.eql(u8, status, "in_progress")) 1 else 2;
+            const id = try generateId(allocator, prefix);
+            defer allocator.free(id);
+            const desc = todo.activeForm orelse "";
+            const priority: i64 = if (std.mem.eql(u8, status, "in_progress")) 1 else default_priority;
 
             const issue = sqlite.Issue{
                 .id = id,
@@ -663,107 +744,72 @@ fn hookSync(allocator: Allocator) !void {
                 .parent = null,
             };
 
-            storage.createIssue(issue) catch {
-                allocator.free(id);
-                continue;
-            };
+            try storage.createIssue(issue);
 
             // Save mapping
-            const key = allocator.dupe(u8, content) catch {
-                allocator.free(id);
-                continue;
-            };
-            const val = allocator.dupe(u8, id) catch {
+            const key = try allocator.dupe(u8, content);
+            const val = allocator.dupe(u8, id) catch |err| {
                 allocator.free(key);
-                allocator.free(id);
-                continue;
+                return err;
             };
-            mapping.put(key, val) catch {
+            mapping.map.put(allocator, key, val) catch |err| {
                 allocator.free(key);
                 allocator.free(val);
+                return err;
             };
-            allocator.free(id);
         }
     }
 
     // Save mapping
-    saveMapping(allocator, mapping);
+    try saveMapping(allocator, mapping);
 }
 
-fn loadMapping(allocator: Allocator) std.StringHashMap([]const u8) {
-    var map = std.StringHashMap([]const u8).init(allocator);
+fn loadMapping(allocator: Allocator) !Mapping {
+    var map: Mapping = .{};
+    errdefer mapping_util.deinit(allocator, &map);
 
-    const file = fs.cwd().openFile(MAPPING_FILE, .{}) catch return map;
+    const file = fs.cwd().openFile(MAPPING_FILE, .{}) catch |err| switch (err) {
+        error.FileNotFound => return map,
+        else => return err,
+    };
     defer file.close();
 
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return map;
+    const content = try file.readToEndAlloc(allocator, max_mapping_bytes);
     defer allocator.free(content);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return map;
+    const parsed = try parseJsonSliceOrError(
+        Mapping,
+        allocator,
+        content,
+        error.InvalidMapping,
+        .{ .ignore_unknown_fields = false },
+    );
     defer parsed.deinit();
 
-    if (parsed.value != .object) return map;
-
-    var it = parsed.value.object.iterator();
+    var it = parsed.value.map.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string) continue;
-        const key = allocator.dupe(u8, entry.key_ptr.*) catch continue;
-        const val = allocator.dupe(u8, entry.value_ptr.string) catch {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        const val = allocator.dupe(u8, entry.value_ptr.*) catch |err| {
             allocator.free(key);
-            continue;
+            return err;
         };
-        map.put(key, val) catch {
+        map.map.put(allocator, key, val) catch |err| {
             allocator.free(key);
             allocator.free(val);
+            return err;
         };
     }
 
     return map;
 }
 
-fn saveMapping(allocator: Allocator, map: std.StringHashMap([]const u8)) void {
-    const file = fs.cwd().createFile(MAPPING_FILE, .{}) catch return;
+fn saveMapping(allocator: Allocator, map: Mapping) !void {
+    const file = try fs.cwd().createFile(MAPPING_FILE, .{});
     defer file.close();
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+    const json = try std.json.Stringify.valueAlloc(allocator, map, .{});
+    defer allocator.free(json);
 
-    buf.appendSlice(allocator, "{") catch return;
-    var first = true;
-    var it = map.iterator();
-    while (it.next()) |entry| {
-        if (!first) buf.appendSlice(allocator, ",") catch return;
-        first = false;
-        appendJsonString(&buf, allocator, entry.key_ptr.*) catch return;
-        buf.appendSlice(allocator, ":") catch return;
-        appendJsonString(&buf, allocator, entry.value_ptr.*) catch return;
-    }
-    buf.appendSlice(allocator, "}") catch return;
-
-    file.writeAll(buf.items) catch return;
-    file.sync() catch return;
-}
-
-fn appendJsonString(buf: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-                var escape: [6]u8 = undefined;
-                _ = std.fmt.bufPrint(&escape, "\\u{x:0>4}", .{c}) catch unreachable;
-                try buf.appendSlice(allocator, &escape);
-            },
-            else => try buf.append(allocator, c),
-        }
-    }
-    try buf.append(allocator, '"');
-}
-
-test "basic" {
-    try std.testing.expect(true);
+    try file.writeAll(json);
+    try file.sync();
 }
