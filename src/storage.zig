@@ -4,7 +4,6 @@ const Allocator = std.mem.Allocator;
 
 const DOTS_DIR = ".dots";
 const ARCHIVE_DIR = ".dots/archive";
-const CONFIG_FILE = ".dots/config";
 
 // Buffer size constants
 const MAX_PATH_LEN = 512; // Maximum path length for file operations
@@ -937,7 +936,10 @@ pub const Storage = struct {
 
     /// Archive an issue by ID (for migration of already-closed issues)
     pub fn archiveIssue(self: *Self, id: []const u8) !void {
-        const path = self.findIssuePath(id) catch return StorageError.IssueNotFound;
+        const path = self.findIssuePath(id) catch |err| switch (err) {
+            StorageError.IssueNotFound => return StorageError.IssueNotFound,
+            else => return err,
+        };
         defer self.allocator.free(path);
         try self.maybeArchive(id, path);
     }
@@ -1441,7 +1443,7 @@ pub const Storage = struct {
 
     // Config stored in .dots/config as simple key=value lines
     pub fn getConfig(self: *Self, key: []const u8) !?[]const u8 {
-        const file = fs.cwd().openFile(CONFIG_FILE, .{}) catch |err| switch (err) {
+        const file = self.dots_dir.openFile("config", .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -1473,7 +1475,7 @@ pub const Storage = struct {
             config.deinit();
         }
 
-        const file = fs.cwd().openFile(CONFIG_FILE, .{}) catch |err| switch (err) {
+        const file = self.dots_dir.openFile("config", .{}) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -1513,6 +1515,6 @@ pub const Storage = struct {
             try buf.append(self.allocator, '\n');
         }
 
-        try writeFileAtomic(fs.cwd(), CONFIG_FILE, buf.items);
+        try writeFileAtomic(self.dots_dir, "config", buf.items);
     }
 };

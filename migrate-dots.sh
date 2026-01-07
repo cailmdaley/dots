@@ -1,7 +1,7 @@
 #!/bin/bash
 # migrate-dots.sh - Convert .beads SQLite to .dots markdown
 # Requirements: sqlite3, jq
-set -e
+set -eo pipefail
 
 # Check for required tools
 command -v sqlite3 >/dev/null 2>&1 || { echo "Error: sqlite3 is required but not installed."; exit 1; }
