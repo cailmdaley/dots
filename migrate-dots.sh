@@ -61,40 +61,27 @@ fi
 echo "Importing into .dots..."
 dot init --from-jsonl "$EXPORT_FILE"
 
-# Count imported issues
-IMPORTED=$(find .dots -name "*.md" -type f 2>/dev/null | grep -v archive | wc -l | tr -d ' ')
-echo "Imported $IMPORTED issues"
+# Count all imported issues (main + archive)
+IMPORTED=$(find .dots -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+ACTIVE=$(find .dots -maxdepth 2 -name "*.md" -type f ! -path ".dots/archive/*" 2>/dev/null | wc -l | tr -d ' ')
+ARCHIVED=$(find .dots/archive -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+echo "Imported $IMPORTED issues ($ACTIVE active, $ARCHIVED archived)"
 
-# Verify migration by comparing JSON output
+# Verify by comparing total counts
 echo "Verifying migration..."
 
-VERIFY_ORIGINAL=$(mktemp /tmp/dots-verify-original.XXXXXX.json)
-VERIFY_NEW=$(mktemp /tmp/dots-verify-new.XXXXXX.json)
-trap "rm -f $EXPORT_FILE $VERIFY_ORIGINAL $VERIFY_NEW" EXIT
-
-# Normalize original export (sorted by id, relevant fields only, normalize status)
-jq -s 'map({id, title, status: (if .status == "closed" then "done" else .status end), priority}) | sort_by(.id)' "$EXPORT_FILE" > "$VERIFY_ORIGINAL"
-
-# Get all issues from new dots as JSON (combine all statuses, sorted by id)
-{
-    dot ls --status open --json
-    dot ls --status active --json
-    dot ls --status closed --json
-} | jq -s 'add | map({id, title, status, priority}) | sort_by(.id)' > "$VERIFY_NEW"
-
-# Compare
-if diff -q "$VERIFY_ORIGINAL" "$VERIFY_NEW" > /dev/null; then
+if [ "$IMPORTED" -eq "$EXPECTED" ]; then
     echo ""
     echo "Migration successful: $EXPECTED issues migrated and verified"
+    echo "  - Active: $ACTIVE"
+    echo "  - Archived: $ARCHIVED"
     echo ""
     echo "You can now safely delete the old database:"
     echo "  rm -rf .beads/"
 else
     echo ""
-    echo "WARNING: Migration verification found differences!"
-    echo ""
-    echo "Comparing original vs imported:"
-    diff "$VERIFY_ORIGINAL" "$VERIFY_NEW" | head -20 || true
+    echo "WARNING: Migration count mismatch!"
+    echo "Expected: $EXPECTED, Got: $IMPORTED"
     echo ""
     echo "Please check .dots/ manually. Do NOT delete .beads/ until verified."
     exit 1

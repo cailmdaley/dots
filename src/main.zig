@@ -965,5 +965,20 @@ fn hydrateFromJsonl(allocator: Allocator, storage: *Storage, jsonl_path: []const
         count += 1;
     }
 
+    // Second pass: archive all closed issues (after all imports, so parent-child relationships are complete)
+    const all_issues = try storage.listIssues(null);
+    defer storage_mod.freeIssues(allocator, all_issues);
+    for (all_issues) |iss| {
+        if (iss.status == .closed) {
+            storage.archiveIssue(iss.id) catch |err| switch (err) {
+                // ChildrenNotClosed is expected if parent closed but children aren't
+                error.ChildrenNotClosed => {},
+                // IssueNotFound can happen if already archived by parent move
+                error.IssueNotFound => {},
+                else => return err,
+            };
+        }
+    }
+
     return count;
 }

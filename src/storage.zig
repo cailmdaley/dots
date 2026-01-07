@@ -935,6 +935,13 @@ pub const Storage = struct {
         }
     }
 
+    /// Archive an issue by ID (for migration of already-closed issues)
+    pub fn archiveIssue(self: *Self, id: []const u8) !void {
+        const path = self.findIssuePath(id) catch return StorageError.IssueNotFound;
+        defer self.allocator.free(path);
+        try self.maybeArchive(id, path);
+    }
+
     fn maybeArchive(self: *Self, id: []const u8, path: []const u8) !void {
         // Don't archive if already in archive
         if (std.mem.startsWith(u8, path, "archive/")) return;
