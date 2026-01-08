@@ -10,6 +10,7 @@ const mapping_util = @import("util/mapping.zig");
 const OhSnap = @import("ohsnap");
 
 const max_output_bytes = 1024 * 1024;
+const max_mapping_bytes = 1024 * 1024;
 const fixed_timestamp = "2024-01-01T00:00:00.000000+00:00";
 
 const RunResult = struct {
@@ -228,6 +229,56 @@ fn openTestStorage(allocator: std.mem.Allocator, dir: []const u8) TestStorage {
 
 fn trimNewline(input: []const u8) []const u8 {
     return std.mem.trimRight(u8, input, "\n");
+}
+
+fn writeMappingFile(allocator: std.mem.Allocator, test_dir: []const u8, map: mapping_util.Mapping) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/.dots/todo-mapping.json", .{test_dir});
+    defer allocator.free(path);
+
+    const file = try fs.createFileAbsolute(path, .{});
+    defer file.close();
+
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(&buffer);
+    const w = &writer.interface;
+    try std.json.Stringify.value(map, .{}, w);
+    try w.flush();
+    try file.sync();
+}
+
+fn readMappingFile(allocator: std.mem.Allocator, test_dir: []const u8) !mapping_util.Mapping {
+    const path = try std.fmt.allocPrint(allocator, "{s}/.dots/todo-mapping.json", .{test_dir});
+    defer allocator.free(path);
+
+    const file = try fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, max_mapping_bytes);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(mapping_util.Mapping, allocator, content, .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+
+    var map: mapping_util.Mapping = .{};
+    errdefer mapping_util.deinit(allocator, &map);
+
+    var it = parsed.value.map.iterator();
+    while (it.next()) |entry| {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        const val = allocator.dupe(u8, entry.value_ptr.*) catch |err| {
+            allocator.free(key);
+            return err;
+        };
+        map.map.put(allocator, key, val) catch |err| {
+            allocator.free(key);
+            allocator.free(val);
+            return err;
+        };
+    }
+
+    return map;
 }
 
 fn isExitCode(term: std.process.Child.Term, code: u8) bool {
@@ -864,6 +915,363 @@ test "cli: parent creates folder structure" {
         std.debug.panic("stat: {}", .{err});
     };
     try std.testing.expect(stat.kind == .directory);
+}
+
+test "cli: find matches titles case-insensitively" {
+    const allocator = std.testing.allocator;
+
+    const test_dir = setupTestDirOrPanic(allocator);
+    defer cleanupTestDirAndFree(allocator, test_dir);
+
+    _ = runDot(allocator, &.{"init"}, test_dir) catch |err| {
+        std.debug.panic("init: {}", .{err});
+    };
+
+    const add1 = runDot(allocator, &.{ "add", "Fix Bug" }, test_dir) catch |err| {
+        std.debug.panic("add1: {}", .{err});
+    };
+    defer add1.deinit(allocator);
+
+    const add2 = runDot(allocator, &.{ "add", "Write docs" }, test_dir) catch |err| {
+        std.debug.panic("add2: {}", .{err});
+    };
+    defer add2.deinit(allocator);
+
+    const add3 = runDot(allocator, &.{ "add", "BUG report" }, test_dir) catch |err| {
+        std.debug.panic("add3: {}", .{err});
+    };
+    defer add3.deinit(allocator);
+
+    const result = runDot(allocator, &.{ "find", "bug" }, test_dir) catch |err| {
+        std.debug.panic("find: {}", .{err});
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expect(isExitCode(result.term, 0));
+
+    var matches: usize = 0;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "Bug") != null or std.mem.indexOf(u8, line, "BUG") != null) {
+            matches += 1;
+        } else {
+            try std.testing.expect(false);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), matches);
+}
+
+test "cli: hook session prints active and ready" {
+    const allocator = std.testing.allocator;
+
+    const test_dir = setupTestDirOrPanic(allocator);
+    defer cleanupTestDirAndFree(allocator, test_dir);
+
+    _ = runDot(allocator, &.{"init"}, test_dir) catch |err| {
+        std.debug.panic("init: {}", .{err});
+    };
+
+    const active_add = runDot(allocator, &.{ "add", "Active task" }, test_dir) catch |err| {
+        std.debug.panic("add active: {}", .{err});
+    };
+    defer active_add.deinit(allocator);
+    const active_id = trimNewline(active_add.stdout);
+
+    const ready_add = runDot(allocator, &.{ "add", "Ready task" }, test_dir) catch |err| {
+        std.debug.panic("add ready: {}", .{err});
+    };
+    defer ready_add.deinit(allocator);
+
+    const on = runDot(allocator, &.{ "on", active_id }, test_dir) catch |err| {
+        std.debug.panic("on: {}", .{err});
+    };
+    defer on.deinit(allocator);
+
+    const result = runDot(allocator, &.{ "hook", "session" }, test_dir) catch |err| {
+        std.debug.panic("hook session: {}", .{err});
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expect(isExitCode(result.term, 0));
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "--- DOTS ---") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ACTIVE:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "READY:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Active task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Ready task") != null);
+}
+
+test "prop: hook sync updates mapping and statuses" {
+    const HookCase = struct {
+        statuses: [4]u2,
+        existing: [4]bool,
+        active_form: [4]bool,
+    };
+
+    const HookTodo = struct {
+        content: []const u8,
+        status: []const u8,
+        activeForm: ?[]const u8 = null,
+    };
+
+    const HookTodoInput = struct {
+        todos: []const HookTodo,
+    };
+
+    const HookEnvelope = struct {
+        tool_name: []const u8,
+        tool_input: HookTodoInput,
+    };
+
+    try qc.check(struct {
+        fn property(args: HookCase) bool {
+            const allocator = std.testing.allocator;
+
+            const test_dir = setupTestDirOrPanic(allocator);
+            defer cleanupTestDirAndFree(allocator, test_dir);
+
+            var ts = openTestStorage(allocator, test_dir);
+
+            var mapping: mapping_util.Mapping = .{};
+            defer mapping_util.deinit(allocator, &mapping);
+
+            var content_bufs: [4][16]u8 = undefined;
+            var id_bufs: [4][16]u8 = undefined;
+            var form_bufs: [4][20]u8 = undefined;
+            var contents: [4][]const u8 = undefined;
+            var ids: [4]?[]const u8 = [_]?[]const u8{null} ** 4;
+            var statuses: [4][]const u8 = undefined;
+            var forms: [4]?[]const u8 = [_]?[]const u8{null} ** 4;
+
+            for (0..4) |i| {
+                contents[i] = std.fmt.bufPrint(&content_bufs[i], "todo-{d}", .{i}) catch return false;
+                const status_case = args.statuses[i] % 3;
+                statuses[i] = switch (status_case) {
+                    0 => "pending",
+                    1 => "in_progress",
+                    else => "completed",
+                };
+                if (args.active_form[i]) {
+                    forms[i] = std.fmt.bufPrint(&form_bufs[i], "detail-{d}", .{i}) catch return false;
+                }
+
+                const needs_mapping = args.existing[i] or status_case == 2;
+                if (needs_mapping) {
+                    const id = std.fmt.bufPrint(&id_bufs[i], "hook-{d}", .{i}) catch return false;
+                    ids[i] = id;
+                    const issue = makeTestIssue(id, .open);
+                    ts.storage.createIssue(issue, null) catch return false;
+
+                    const key = allocator.dupe(u8, contents[i]) catch return false;
+                    const val = allocator.dupe(u8, id) catch {
+                        allocator.free(key);
+                        return false;
+                    };
+                    mapping.map.put(allocator, key, val) catch {
+                        allocator.free(key);
+                        allocator.free(val);
+                        return false;
+                    };
+                }
+            }
+
+            ts.deinit();
+
+            writeMappingFile(allocator, test_dir, mapping) catch return false;
+
+            var todos: [4]HookTodo = undefined;
+            for (0..4) |i| {
+                todos[i] = .{ .content = contents[i], .status = statuses[i], .activeForm = forms[i] };
+            }
+
+            const envelope = HookEnvelope{
+                .tool_name = "TodoWrite",
+                .tool_input = .{ .todos = &todos },
+            };
+            const input = std.json.Stringify.valueAlloc(allocator, envelope, .{}) catch return false;
+            defer allocator.free(input);
+
+            const result = runDotWithInput(allocator, &.{ "hook", "sync" }, test_dir, input) catch |err| {
+                std.debug.panic("hook sync: {}", .{err});
+            };
+            defer result.deinit(allocator);
+            if (!isExitCode(result.term, 0)) return false;
+
+            var parsed_map = readMappingFile(allocator, test_dir) catch return false;
+            defer mapping_util.deinit(allocator, &parsed_map);
+
+            var verify = openTestStorage(allocator, test_dir);
+            defer verify.deinit();
+
+            for (0..4) |i| {
+                const status_case = args.statuses[i] % 3;
+                const expected_status: Status = switch (status_case) {
+                    0 => .open,
+                    1 => .active,
+                    else => .closed,
+                };
+
+                if (status_case == 2) {
+                    if (parsed_map.map.get(contents[i]) != null) return false;
+                    const id = ids[i] orelse return false;
+                    const issue = verify.storage.getIssue(id) catch return false;
+                    const iss = issue orelse return false;
+                    defer iss.deinit(allocator);
+                    if (iss.status != .closed) return false;
+                    if (iss.closed_at == null) return false;
+                    continue;
+                }
+
+                const mapped_id = parsed_map.map.get(contents[i]) orelse return false;
+                if (ids[i]) |existing_id| {
+                    if (!std.mem.eql(u8, mapped_id, existing_id)) return false;
+                }
+
+                const issue = verify.storage.getIssue(mapped_id) catch return false;
+                const iss = issue orelse return false;
+                defer iss.deinit(allocator);
+                if (iss.status != expected_status) return false;
+
+                if (!args.existing[i] and forms[i] != null) {
+                    if (!std.mem.eql(u8, iss.description, forms[i].?)) return false;
+                }
+            }
+
+            return true;
+        }
+    }.property, .{ .iterations = 40, .seed = 0xB00B });
+}
+
+test "cli: jsonl hydration imports issues and archives closed" {
+    const allocator = std.testing.allocator;
+
+    const test_dir = setupTestDirOrPanic(allocator);
+    defer cleanupTestDirAndFree(allocator, test_dir);
+
+    const jsonl_path = try std.fmt.allocPrint(allocator, "{s}/import.jsonl", .{test_dir});
+    defer allocator.free(jsonl_path);
+
+    const JsonlDependency = struct {
+        depends_on_id: []const u8,
+        type: ?[]const u8 = null,
+    };
+
+    const JsonlIssue = struct {
+        id: []const u8,
+        title: []const u8,
+        description: ?[]const u8 = null,
+        status: []const u8,
+        priority: i64,
+        issue_type: []const u8,
+        assignee: ?[]const u8 = null,
+        created_at: []const u8,
+        updated_at: ?[]const u8 = null,
+        closed_at: ?[]const u8 = null,
+        close_reason: ?[]const u8 = null,
+        dependencies: ?[]const JsonlDependency = null,
+    };
+
+    const issues = [_]JsonlIssue{
+        .{
+            .id = "parent",
+            .title = "Parent",
+            .status = "open",
+            .priority = 1,
+            .issue_type = "task",
+            .created_at = fixed_timestamp,
+        },
+        .{
+            .id = "child",
+            .title = "Child",
+            .status = "open",
+            .priority = 2,
+            .issue_type = "task",
+            .created_at = fixed_timestamp,
+            .dependencies = &.{.{ .depends_on_id = "parent", .type = "parent-child" }},
+        },
+        .{
+            .id = "blocker",
+            .title = "Blocker",
+            .status = "open",
+            .priority = 2,
+            .issue_type = "task",
+            .created_at = fixed_timestamp,
+        },
+        .{
+            .id = "blocked",
+            .title = "Blocked",
+            .status = "open",
+            .priority = 3,
+            .issue_type = "task",
+            .created_at = fixed_timestamp,
+            .dependencies = &.{.{ .depends_on_id = "blocker", .type = "blocks" }},
+        },
+        .{
+            .id = "closed",
+            .title = "Closed",
+            .status = "done",
+            .priority = 1,
+            .issue_type = "task",
+            .created_at = fixed_timestamp,
+            .closed_at = fixed_timestamp,
+        },
+    };
+
+    const file = try fs.createFileAbsolute(jsonl_path, .{});
+    defer file.close();
+
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(&buffer);
+    const w = &writer.interface;
+    for (issues) |issue| {
+        try std.json.Stringify.value(issue, .{}, w);
+        try w.writeByte('\n');
+    }
+    try w.flush();
+    try file.sync();
+
+    const init = runDot(allocator, &.{ "init", "--from-jsonl", jsonl_path }, test_dir) catch |err| {
+        std.debug.panic("init: {}", .{err});
+    };
+    defer init.deinit(allocator);
+    try std.testing.expect(isExitCode(init.term, 0));
+
+    var ts = openTestStorage(allocator, test_dir);
+    defer ts.deinit();
+
+    const parent = ts.storage.getIssue("parent") catch |err| {
+        std.debug.panic("parent: {}", .{err});
+    };
+    defer parent.?.deinit(allocator);
+    try std.testing.expect(parent != null);
+
+    const child = ts.storage.getIssue("child") catch |err| {
+        std.debug.panic("child: {}", .{err});
+    };
+    defer child.?.deinit(allocator);
+    try std.testing.expect(child != null);
+    try std.testing.expectEqualStrings("parent", child.?.parent.?);
+
+    const blocked = ts.storage.getIssue("blocked") catch |err| {
+        std.debug.panic("blocked: {}", .{err});
+    };
+    defer blocked.?.deinit(allocator);
+    try std.testing.expect(blocked != null);
+    try std.testing.expectEqual(@as(usize, 1), blocked.?.blocks.len);
+    try std.testing.expectEqualStrings("blocker", blocked.?.blocks[0]);
+
+    const closed = ts.storage.getIssue("closed") catch |err| {
+        std.debug.panic("closed: {}", .{err});
+    };
+    defer closed.?.deinit(allocator);
+    try std.testing.expect(closed != null);
+    try std.testing.expectEqual(Status.closed, closed.?.status);
+
+    const closed_list = ts.storage.listIssues(.closed) catch |err| {
+        std.debug.panic("list: {}", .{err});
+    };
+    defer storage_mod.freeIssues(allocator, closed_list);
+    try std.testing.expectEqual(@as(usize, 0), closed_list.len);
 }
 
 test "storage: ID prefix resolution" {
