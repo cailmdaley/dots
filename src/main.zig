@@ -696,10 +696,27 @@ fn validateHookStatus(status: []const u8) bool {
 }
 
 fn hookSync(allocator: Allocator) !void {
-    // Read stdin
-    const input = try fs.File.stdin().readToEndAlloc(allocator, max_hook_input_bytes);
+    // Read stdin with timeout to avoid blocking forever when Claude Code
+    // doesn't provide input (known bug: github.com/anthropics/claude-code/issues/6403)
+    const stdin = fs.File.stdin();
+    const stdin_fd = stdin.handle;
+
+    // If stdin is a TTY, no hook input expected
+    if (std.posix.isatty(stdin_fd)) return;
+
+    // Poll for data with 100ms timeout
+    var fds = [_]std.posix.pollfd{.{
+        .fd = stdin_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const poll_result = std.posix.poll(&fds, 100) catch return;
+    if (poll_result == 0) return; // Timeout, no data
+    if (fds[0].revents & std.posix.POLL.IN == 0) return; // No data available
+
+    const input = try stdin.readToEndAlloc(allocator, max_hook_input_bytes);
     defer allocator.free(input);
-    if (input.len == 0) return error.EmptyHookInput;
+    if (input.len == 0) return;
 
     // Parse JSON
     const parsed = try parseJsonSliceOrError(

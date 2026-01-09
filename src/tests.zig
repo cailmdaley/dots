@@ -1971,7 +1971,8 @@ test "snap: simple struct" {
     };
     const data = TestStruct{ .name = "test", .value = 42 };
     const oh = OhSnap{};
-    try oh.snap(@src(),
+    try oh.snap(
+        @src(),
         \\tests.test.snap: simple struct.TestStruct
         \\  .name: []const u8
         \\    "test"
@@ -2115,6 +2116,29 @@ test "snap: json output format" {
         \\Second task (p2)
         \\"
     ).expectEqual(output.items);
+}
+
+test "cli: hook sync without stdin returns success" {
+    // Regression test for github.com/anthropics/claude-code/issues/6403
+    // hook sync should return 0 when no stdin provided (TTY or timeout)
+    const allocator = std.testing.allocator;
+
+    const test_dir = setupTestDirOrPanic(allocator);
+    defer cleanupTestDirAndFree(allocator, test_dir);
+
+    _ = runDot(allocator, &.{"init"}, test_dir) catch |err| {
+        std.debug.panic("init: {}", .{err});
+    };
+
+    // Call hook sync without any input (simulates missing stdin from Claude Code bug)
+    const result = runDotWithInput(allocator, &.{ "hook", "sync" }, test_dir, null) catch |err| {
+        std.debug.panic("hook sync: {}", .{err});
+    };
+    defer result.deinit(allocator);
+
+    // Should succeed with exit code 0, not block or error
+    try std.testing.expect(isExitCode(result.term, 0));
+    try std.testing.expectEqualStrings("", result.stderr);
 }
 
 test "snap: tree output format" {
