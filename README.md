@@ -38,7 +38,7 @@ cp zig-out/bin/dot ~/.local/bin/
 
 ```bash
 dot --version
-# Output: dots 0.5.2
+# Output: dots 0.5.4
 ```
 
 ## Quick Start
@@ -226,12 +226,28 @@ Description as markdown body here.
 
 ### ID Format
 
-IDs are prefixed hex strings like `dots-a3f2b1c8d9e04a7b`. The prefix is configurable via `.dots/config`. Commands accept short prefixes:
+IDs have the format `{prefix}-{slug}-{hex}` where:
+- `prefix`: Project prefix from `.dots/config` (default: `dots`)
+- `slug`: URL-safe abbreviation of the title (max 32 chars)
+- `hex`: 8-character random hex suffix
+
+Example: `dots-fix-user-auth-a3f2b1c8`
+
+The slug uses common abbreviations (authentication→auth, configuration→config, etc.) and truncates at word boundaries. Run `dot slugify` to rename existing IDs to include slugs.
+
+Commands accept short prefixes:
 
 ```bash
-dot on a3f2b1    # Matches dots-a3f2b1c8d9e04a7b
+dot on a3f2b1    # Matches dots-fix-user-auth-a3f2b1c8
 dot show a3f     # Error if ambiguous (multiple matches)
 ```
+
+### Slugify
+
+```bash
+dot slugify
+```
+Renames all issue IDs (including archived) to include slugs based on their titles. Preserves the hex suffix and updates all dependency references.
 
 ### Status Flow
 
