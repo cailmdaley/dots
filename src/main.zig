@@ -529,23 +529,16 @@ fn cmdFind(allocator: Allocator, args: []const []const u8) !void {
     const w = stdout();
 
     // Print open/active dots first
-    var has_open = false;
     for (issues) |issue| {
         if (issue.status != .closed) {
             try w.print("[{s}] {c} {s}\n", .{ issue.id, issue.status.char(), issue.title });
-            has_open = true;
         }
     }
 
-    // Print closed dots with separator
-    var has_closed = false;
+    // Then closed dots
     for (issues) |issue| {
         if (issue.status == .closed) {
-            if (!has_closed and has_open) {
-                try w.print("--- archived ---\n", .{});
-            }
             try w.print("[{s}] {c} {s}\n", .{ issue.id, issue.status.char(), issue.title });
-            has_closed = true;
         }
     }
 }
