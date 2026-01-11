@@ -1707,8 +1707,11 @@ pub const Storage = struct {
             const in_title = containsIgnoreCase(issue.title, query);
             const in_desc = containsIgnoreCase(issue.description, query);
             const in_reason = if (issue.close_reason) |r| containsIgnoreCase(r, query) else false;
+            const in_created = containsIgnoreCase(issue.created_at, query);
+            const in_closed = if (issue.closed_at) |c| containsIgnoreCase(c, query) else false;
+            const in_due = if (issue.due) |d| containsIgnoreCase(d, query) else false;
 
-            if (in_title or in_desc or in_reason) {
+            if (in_title or in_desc or in_reason or in_created or in_closed or in_due) {
                 const cloned = try self.cloneIssue(issue);
                 try matches.append(self.allocator, cloned);
             }
