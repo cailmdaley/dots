@@ -200,7 +200,7 @@ const USAGE =
     \\  dot show <id>                Show dot details
     \\  dot ready [--json]           Show unblocked dots
     \\  dot tree                     Show hierarchy
-    \\  dot find "query" [-a]        Search dots (--archive for closed)
+    \\  dot find "query"             Search all dots (open first, then archived)
     \\  dot purge                    Delete archived dots
     \\  dot init                     Initialize .dots directory
     \\
@@ -518,30 +518,35 @@ fn cmdTree(allocator: Allocator, _: []const []const u8) !void {
 }
 
 fn cmdFind(allocator: Allocator, args: []const []const u8) !void {
-    if (args.len == 0) fatal("Usage: dot find <query> [--archive]\n", .{});
-
-    var include_archive = false;
-    var query: ?[]const u8 = null;
-
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--archive") or std.mem.eql(u8, arg, "-a")) {
-            include_archive = true;
-        } else if (query == null) {
-            query = arg;
-        }
-    }
-
-    if (query == null) fatal("Usage: dot find <query> [--archive]\n", .{});
+    if (args.len == 0) fatal("Usage: dot find <query>\n", .{});
 
     var storage = try openStorage(allocator);
     defer storage.close();
 
-    const issues = try storage.searchIssues(query.?, include_archive);
+    const issues = try storage.searchIssues(args[0]);
     defer storage_mod.freeIssues(allocator, issues);
 
     const w = stdout();
+
+    // Print open/active dots first
+    var has_open = false;
     for (issues) |issue| {
-        try w.print("[{s}] {c} {s}\n", .{ issue.id, issue.status.char(), issue.title });
+        if (issue.status != .closed) {
+            try w.print("[{s}] {c} {s}\n", .{ issue.id, issue.status.char(), issue.title });
+            has_open = true;
+        }
+    }
+
+    // Print closed dots with separator
+    var has_closed = false;
+    for (issues) |issue| {
+        if (issue.status == .closed) {
+            if (!has_closed and has_open) {
+                try w.print("--- archived ---\n", .{});
+            }
+            try w.print("[{s}] {c} {s}\n", .{ issue.id, issue.status.char(), issue.title });
+            has_closed = true;
+        }
     }
 }
 

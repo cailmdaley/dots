@@ -1660,11 +1660,8 @@ pub const Storage = struct {
         return children.toOwnedSlice(self.allocator);
     }
 
-    pub fn searchIssues(self: *Self, query: []const u8, include_archive: bool) ![]Issue {
-        const all_issues = if (include_archive)
-            try self.listAllIssuesIncludingArchived()
-        else
-            try self.listIssues(null);
+    pub fn searchIssues(self: *Self, query: []const u8) ![]Issue {
+        const all_issues = try self.listAllIssuesIncludingArchived();
         defer freeIssues(self.allocator, all_issues);
 
         var matches: std.ArrayList(Issue) = .{};
@@ -1674,7 +1671,11 @@ pub const Storage = struct {
         }
 
         for (all_issues) |issue| {
-            if (containsIgnoreCase(issue.title, query) or containsIgnoreCase(issue.description, query)) {
+            const in_title = containsIgnoreCase(issue.title, query);
+            const in_desc = containsIgnoreCase(issue.description, query);
+            const in_reason = if (issue.close_reason) |r| containsIgnoreCase(r, query) else false;
+
+            if (in_title or in_desc or in_reason) {
                 const cloned = try self.cloneIssue(issue);
                 try matches.append(self.allocator, cloned);
             }
