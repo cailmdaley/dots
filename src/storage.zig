@@ -1660,8 +1660,11 @@ pub const Storage = struct {
         return children.toOwnedSlice(self.allocator);
     }
 
-    pub fn searchIssues(self: *Self, query: []const u8) ![]Issue {
-        const all_issues = try self.listIssues(null);
+    pub fn searchIssues(self: *Self, query: []const u8, include_archive: bool) ![]Issue {
+        const all_issues = if (include_archive)
+            try self.listAllIssuesIncludingArchived()
+        else
+            try self.listIssues(null);
         defer freeIssues(self.allocator, all_issues);
 
         var matches: std.ArrayList(Issue) = .{};
