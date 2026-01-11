@@ -192,7 +192,7 @@ const USAGE =
     \\
     \\Commands:
     \\  dot "title"                  Quick add a dot
-    \\  dot add "title" [options]    Add a dot (-p priority, -d desc, -P parent, -a after)
+    \\  dot add "title" [options]    Add a dot (-p priority, -d desc, -D due, -P parent, -a after)
     \\  dot ls [--status S] [--json] List dots
     \\  dot on <id>                  Start working (turn it on!)
     \\  dot off <id> [-r reason]     Complete ("cross it off")
@@ -260,6 +260,7 @@ fn cmdAdd(allocator: Allocator, args: []const []const u8) !void {
     var priority: i64 = default_priority;
     var parent: ?[]const u8 = null;
     var after: ?[]const u8 = null;
+    var due: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -272,6 +273,8 @@ fn cmdAdd(allocator: Allocator, args: []const []const u8) !void {
             parent = v;
         } else if (getArg(args, &i, "-a")) |v| {
             after = v;
+        } else if (getArg(args, &i, "-D") orelse getArg(args, &i, "--due")) |v| {
+            due = v;
         } else if (title.len == 0 and args[i].len > 0 and args[i][0] != '-') {
             title = args[i];
         }
@@ -330,6 +333,7 @@ fn cmdAdd(allocator: Allocator, args: []const []const u8) !void {
         .issue_type = "task",
         .assignee = null,
         .created_at = now,
+        .due = due,
         .closed_at = null,
         .close_reason = null,
         .blocks = blocks,
@@ -489,6 +493,7 @@ fn cmdShow(allocator: Allocator, args: []const []const u8) !void {
     });
     if (iss.description.len > 0) try w.print("Desc:     {s}\n", .{iss.description});
     try w.print("Created:  {s}\n", .{iss.created_at});
+    if (iss.due) |d| try w.print("Due:      {s}\n", .{d});
     if (iss.closed_at) |ca| try w.print("Closed:   {s}\n", .{ca});
     if (iss.close_reason) |r| try w.print("Reason:   {s}\n", .{r});
 }
@@ -713,8 +718,10 @@ const JsonIssue = struct {
     priority: i64,
     issue_type: []const u8,
     created_at: []const u8,
+    due: ?[]const u8 = null,
     closed_at: ?[]const u8 = null,
     close_reason: ?[]const u8 = null,
+    assignee: ?[]const u8 = null,
 };
 
 fn writeIssueJson(issue: Issue, w: *std.Io.Writer) !void {
@@ -726,6 +733,7 @@ fn writeIssueJson(issue: Issue, w: *std.Io.Writer) !void {
         .priority = issue.priority,
         .issue_type = issue.issue_type,
         .created_at = issue.created_at,
+        .due = issue.due,
         .closed_at = issue.closed_at,
         .close_reason = issue.close_reason,
     };
@@ -941,6 +949,7 @@ fn hookSync(allocator: Allocator) !void {
                 .issue_type = "task",
                 .assignee = null,
                 .created_at = now,
+                .due = null,
                 .closed_at = null,
                 .close_reason = null,
                 .blocks = &.{},
@@ -1042,6 +1051,7 @@ const JsonlIssue = struct {
     issue_type: []const u8,
     assignee: ?[]const u8 = null,
     created_at: []const u8,
+    due: ?[]const u8 = null,
     updated_at: ?[]const u8 = null,
     closed_at: ?[]const u8 = null,
     close_reason: ?[]const u8 = null,
@@ -1103,6 +1113,7 @@ fn hydrateFromJsonl(allocator: Allocator, storage: *Storage, jsonl_path: []const
             .issue_type = obj.issue_type,
             .assignee = obj.assignee,
             .created_at = obj.created_at,
+            .due = obj.due,
             .closed_at = obj.closed_at,
             .close_reason = obj.close_reason,
             .blocks = &.{},

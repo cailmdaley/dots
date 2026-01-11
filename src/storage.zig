@@ -122,6 +122,7 @@ pub const Issue = struct {
     issue_type: []const u8,
     assignee: ?[]const u8,
     created_at: []const u8,
+    due: ?[]const u8,
     closed_at: ?[]const u8,
     close_reason: ?[]const u8,
     blocks: []const []const u8,
@@ -145,6 +146,7 @@ pub const Issue = struct {
             .issue_type = self.issue_type,
             .assignee = self.assignee,
             .created_at = self.created_at,
+            .due = self.due,
             .closed_at = closed_at,
             .close_reason = close_reason,
             .blocks = self.blocks,
@@ -163,6 +165,7 @@ pub const Issue = struct {
             .issue_type = self.issue_type,
             .assignee = self.assignee,
             .created_at = self.created_at,
+            .due = self.due,
             .closed_at = self.closed_at,
             .close_reason = self.close_reason,
             .blocks = blocks,
@@ -189,6 +192,9 @@ pub const Issue = struct {
 
         const created_at = try allocator.dupe(u8, self.created_at);
         errdefer allocator.free(created_at);
+
+        const due = if (self.due) |d| try allocator.dupe(u8, d) else null;
+        errdefer if (due) |d| allocator.free(d);
 
         const closed_at = if (self.closed_at) |c| try allocator.dupe(u8, c) else null;
         errdefer if (closed_at) |c| allocator.free(c);
@@ -218,6 +224,7 @@ pub const Issue = struct {
             .issue_type = issue_type,
             .assignee = assignee,
             .created_at = created_at,
+            .due = due,
             .closed_at = closed_at,
             .close_reason = close_reason,
             .blocks = try blocks.toOwnedSlice(allocator),
@@ -232,6 +239,7 @@ pub const Issue = struct {
         allocator.free(self.issue_type);
         if (self.assignee) |s| allocator.free(s);
         allocator.free(self.created_at);
+        if (self.due) |s| allocator.free(s);
         if (self.closed_at) |s| allocator.free(s);
         if (self.close_reason) |s| allocator.free(s);
         for (self.blocks) |b| allocator.free(b);
@@ -278,6 +286,7 @@ const Frontmatter = struct {
     issue_type: []const u8 = "task",
     assignee: ?[]const u8 = null,
     created_at: []const u8 = "",
+    due: ?[]const u8 = null,
     closed_at: ?[]const u8 = null,
     close_reason: ?[]const u8 = null,
     blocks: []const []const u8 = &.{},
@@ -305,6 +314,7 @@ const FrontmatterField = enum {
     issue_type,
     assignee,
     created_at,
+    due,
     closed_at,
     close_reason,
     blocks,
@@ -317,6 +327,7 @@ const frontmatter_field_map = std.StaticStringMap(FrontmatterField).initComptime
     .{ "issue-type", .issue_type },
     .{ "assignee", .assignee },
     .{ "created-at", .created_at },
+    .{ "due", .due },
     .{ "closed-at", .closed_at },
     .{ "close-reason", .close_reason },
     .{ "blocks", .blocks },
@@ -443,6 +454,7 @@ fn parseFrontmatter(allocator: Allocator, content: []const u8) !ParseResult {
             .issue_type => fm.issue_type = value,
             .assignee => fm.assignee = if (value.len > 0) value else null,
             .created_at => fm.created_at = value,
+            .due => fm.due = if (value.len > 0) value else null,
             .closed_at => fm.closed_at = if (value.len > 0) value else null,
             .close_reason => fm.close_reason = if (value.len > 0) value else null,
             .blocks => in_blocks = true,
@@ -518,6 +530,11 @@ fn serializeFrontmatter(allocator: Allocator, issue: Issue) ![]u8 {
 
     try buf.appendSlice(allocator, "\ncreated-at: ");
     try writeYamlValue(&buf, allocator, issue.created_at);
+
+    if (issue.due) |due| {
+        try buf.appendSlice(allocator, "\ndue: ");
+        try writeYamlValue(&buf, allocator, due);
+    }
 
     if (issue.closed_at) |closed_at| {
         try buf.appendSlice(allocator, "\nclosed-at: ");
@@ -1017,6 +1034,9 @@ pub const Storage = struct {
         const created_at = try self.allocator.dupe(u8, parsed.frontmatter.created_at);
         errdefer self.allocator.free(created_at);
 
+        const due = if (parsed.frontmatter.due) |d| try self.allocator.dupe(u8, d) else null;
+        errdefer if (due) |d| self.allocator.free(d);
+
         const closed_at = if (parsed.frontmatter.closed_at) |c| try self.allocator.dupe(u8, c) else null;
         errdefer if (closed_at) |c| self.allocator.free(c);
 
@@ -1034,6 +1054,7 @@ pub const Storage = struct {
             .issue_type = issue_type,
             .assignee = assignee,
             .created_at = created_at,
+            .due = due,
             .closed_at = closed_at,
             .close_reason = close_reason,
             .blocks = parsed.allocated_blocks,
@@ -1293,6 +1314,7 @@ pub const Storage = struct {
             .issue_type = issue.issue_type,
             .assignee = issue.assignee,
             .created_at = issue.created_at,
+            .due = issue.due,
             .closed_at = issue.closed_at,
             .close_reason = issue.close_reason,
             .blocks = issue.blocks,
