@@ -643,7 +643,10 @@ fn cmdSlugify(allocator: Allocator, _: []const []const u8) !void {
 
     var count: usize = 0;
     for (issues) |issue| {
-        const renamed = try slugifyIssue(allocator, &storage, prefix, issue.id, issue.title);
+        const renamed = slugifyIssue(allocator, &storage, prefix, issue.id, issue.title) catch |err| {
+            try stderr().print("Error slugifying {s}: {any}\n", .{ issue.id, err });
+            continue;
+        };
         if (renamed) {
             count += 1;
         }
