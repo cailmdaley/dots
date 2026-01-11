@@ -499,6 +499,25 @@ fn cmdShow(allocator: Allocator, args: []const []const u8) !void {
 }
 
 fn cmdTree(allocator: Allocator, args: []const []const u8) !void {
+    if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
+        const w = stdout();
+        try w.writeAll(
+            \\Usage: dot tree [id]
+            \\
+            \\Show dot hierarchy.
+            \\
+            \\Without arguments: shows all open root dots and their children.
+            \\With id: shows that specific dot's tree (including closed children).
+            \\         Works for archived dots too.
+            \\
+            \\Examples:
+            \\  dot tree                    Show all open root dots
+            \\  dot tree loom-my-project    Show specific dot and its children
+            \\
+        );
+        return;
+    }
+
     var storage = try openStorage(allocator);
     defer storage.close();
 
@@ -547,7 +566,22 @@ fn cmdTree(allocator: Allocator, args: []const []const u8) !void {
 }
 
 fn cmdFind(allocator: Allocator, args: []const []const u8) !void {
-    if (args.len == 0) fatal("Usage: dot find <query>\n", .{});
+    if (args.len == 0 or hasFlag(args, "--help") or hasFlag(args, "-h")) {
+        const w = stdout();
+        try w.writeAll(
+            \\Usage: dot find <query>
+            \\
+            \\Search all dots (open first, then archived).
+            \\
+            \\Searches: title, description, close-reason, created-at, closed-at, due
+            \\
+            \\Examples:
+            \\  dot find "auth"      Search for dots mentioning auth
+            \\  dot find "2026-01"   Find dots from January 2026
+            \\
+        );
+        return;
+    }
 
     var storage = try openStorage(allocator);
     defer storage.close();
