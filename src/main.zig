@@ -199,7 +199,7 @@ const USAGE =
     \\  dot rm <id>                  Remove a dot
     \\  dot show <id>                Show dot details
     \\  dot ready [--json]           Show unblocked dots
-    \\  dot tree                     Show hierarchy
+    \\  dot tree [id]                Show hierarchy (specific dot shows all children)
     \\  dot find "query"             Search all dots (open first, then archived)
     \\  dot purge                    Delete archived dots
     \\  dot init                     Initialize .dots directory
@@ -498,15 +498,20 @@ fn cmdShow(allocator: Allocator, args: []const []const u8) !void {
     if (iss.close_reason) |r| try w.print("Reason:   {s}\n", .{r});
 }
 
-fn cmdTree(allocator: Allocator, _: []const []const u8) !void {
+fn cmdTree(allocator: Allocator, args: []const []const u8) !void {
     var storage = try openStorage(allocator);
     defer storage.close();
 
-    const roots = try storage.getRootIssues();
-    defer storage_mod.freeIssues(allocator, roots);
-
     const w = stdout();
-    for (roots) |root| {
+
+    if (args.len > 0) {
+        // Show tree for a specific dot (including closed)
+        const resolved = resolveIdOrFatal(&storage, args[0]);
+        defer allocator.free(resolved);
+
+        const root = try storage.getIssue(resolved) orelse fatal("Issue not found: {s}\n", .{args[0]});
+        defer root.deinit(allocator);
+
         try w.print("[{s}] {s} {s}\n", .{ root.id, root.status.symbol(), root.title });
 
         const children = try storage.getChildren(root.id);
@@ -518,6 +523,25 @@ fn cmdTree(allocator: Allocator, _: []const []const u8) !void {
                 "  └─ [{s}] {s} {s}{s}\n",
                 .{ child.issue.id, child.issue.status.symbol(), child.issue.title, blocked_msg },
             );
+        }
+    } else {
+        // Show all root open issues
+        const roots = try storage.getRootIssues();
+        defer storage_mod.freeIssues(allocator, roots);
+
+        for (roots) |root| {
+            try w.print("[{s}] {s} {s}\n", .{ root.id, root.status.symbol(), root.title });
+
+            const children = try storage.getChildren(root.id);
+            defer storage_mod.freeChildIssues(allocator, children);
+
+            for (children) |child| {
+                const blocked_msg: []const u8 = if (child.blocked) " (blocked)" else "";
+                try w.print(
+                    "  └─ [{s}] {s} {s}{s}\n",
+                    .{ child.issue.id, child.issue.status.symbol(), child.issue.title, blocked_msg },
+                );
+            }
         }
     }
 }

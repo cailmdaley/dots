@@ -1647,9 +1647,20 @@ pub const Storage = struct {
             children.deinit(self.allocator);
         }
 
-        // Open parent folder
+        // Try main folder first, then archive
+        var base_path_buf: [MAX_PATH_LEN]u8 = undefined;
+        var base_path: []const u8 = parent_id;
+
         var folder = self.dots_dir.openDir(parent_id, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return children.toOwnedSlice(self.allocator),
+            error.FileNotFound => blk: {
+                // Try archive
+                const archive_path = std.fmt.bufPrint(&base_path_buf, "archive/{s}", .{parent_id}) catch return StorageError.IoError;
+                base_path = archive_path;
+                break :blk self.dots_dir.openDir(archive_path, .{ .iterate = true }) catch |err2| switch (err2) {
+                    error.FileNotFound => return children.toOwnedSlice(self.allocator),
+                    else => return err2,
+                };
+            },
             else => return err,
         };
         defer folder.close();
@@ -1660,8 +1671,8 @@ pub const Storage = struct {
                 const id = entry.name[0 .. entry.name.len - 3];
                 if (std.mem.eql(u8, id, parent_id)) continue; // Skip parent itself
 
-                var path_buf: [MAX_PATH_LEN]u8 = undefined;
-                const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ parent_id, entry.name }) catch return StorageError.IoError;
+                var issue_path_buf: [MAX_PATH_LEN]u8 = undefined;
+                const path = std.fmt.bufPrint(&issue_path_buf, "{s}/{s}", .{ base_path, entry.name }) catch continue;
 
                 const issue = self.readIssueFromPath(path, id) catch |err| switch (err) {
                     StorageError.InvalidFrontmatter, StorageError.InvalidStatus => continue,
