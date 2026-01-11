@@ -1625,9 +1625,20 @@ pub const Storage = struct {
             children.deinit(self.allocator);
         }
 
-        // Open parent folder
+        // Try main folder first, then archive
+        var base_path_buf: [MAX_PATH_LEN]u8 = undefined;
+        var base_path: []const u8 = parent_id;
+
         var folder = self.dots_dir.openDir(parent_id, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return children.toOwnedSlice(self.allocator),
+            error.FileNotFound => blk: {
+                // Try archive
+                const archive_path = std.fmt.bufPrint(&base_path_buf, "archive/{s}", .{parent_id}) catch return StorageError.IoError;
+                base_path = archive_path;
+                break :blk self.dots_dir.openDir(archive_path, .{ .iterate = true }) catch |err2| switch (err2) {
+                    error.FileNotFound => return children.toOwnedSlice(self.allocator),
+                    else => return err2,
+                };
+            },
             else => return err,
         };
         defer folder.close();
@@ -1639,7 +1650,7 @@ pub const Storage = struct {
                 if (std.mem.eql(u8, id, parent_id)) continue; // Skip parent itself
 
                 var path_buf: [MAX_PATH_LEN]u8 = undefined;
-                const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ parent_id, entry.name }) catch return StorageError.IoError;
+                const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base_path, entry.name }) catch return StorageError.IoError;
 
                 const issue = self.readIssueFromPath(path, id) catch |err| switch (err) {
                     StorageError.InvalidFrontmatter, StorageError.InvalidStatus => continue,
@@ -1661,7 +1672,7 @@ pub const Storage = struct {
     }
 
     pub fn searchIssues(self: *Self, query: []const u8) ![]Issue {
-        const all_issues = try self.listIssues(null);
+        const all_issues = try self.listAllIssuesIncludingArchived();
         defer freeIssues(self.allocator, all_issues);
 
         var matches: std.ArrayList(Issue) = .{};
@@ -1671,7 +1682,13 @@ pub const Storage = struct {
         }
 
         for (all_issues) |issue| {
-            if (containsIgnoreCase(issue.title, query) or containsIgnoreCase(issue.description, query)) {
+            const in_title = containsIgnoreCase(issue.title, query);
+            const in_desc = containsIgnoreCase(issue.description, query);
+            const in_reason = if (issue.close_reason) |r| containsIgnoreCase(r, query) else false;
+            const in_created = containsIgnoreCase(issue.created_at, query);
+            const in_closed = if (issue.closed_at) |c| containsIgnoreCase(c, query) else false;
+
+            if (in_title or in_desc or in_reason or in_created or in_closed) {
                 const cloned = try self.cloneIssue(issue);
                 try matches.append(self.allocator, cloned);
             }
