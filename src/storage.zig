@@ -879,7 +879,7 @@ pub const Storage = struct {
     fn findMatchingIdsInner(self: *Self, dir: fs.Dir, prefix: []const u8, matches: *std.ArrayList([]const u8), parent_folder: ?[]const u8) !void {
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+            if ((entry.kind == .file or entry.kind == .unknown) and std.mem.endsWith(u8, entry.name, ".md")) {
                 const id = entry.name[0 .. entry.name.len - 3];
                 // Skip if this file matches parent folder name (already counted)
                 if (parent_folder) |pf| {
@@ -889,15 +889,15 @@ pub const Storage = struct {
                     const duped = try self.allocator.dupe(u8, id);
                     try matches.append(self.allocator, duped);
                 }
-            } else if (entry.kind == .directory and !std.mem.eql(u8, entry.name, "archive")) {
-                // Check folder name as potential ID
+            } else if ((entry.kind == .directory or entry.kind == .unknown) and !std.mem.eql(u8, entry.name, "archive")) {
+                // Check folder name as potential ID (try opening as dir for .unknown)
+                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                defer subdir.close();
                 if (std.mem.startsWith(u8, entry.name, prefix)) {
                     const duped = try self.allocator.dupe(u8, entry.name);
                     try matches.append(self.allocator, duped);
                 }
                 // Recurse into folder, passing folder name to skip self-reference
-                var subdir = try dir.openDir(entry.name, .{ .iterate = true });
-                defer subdir.close();
                 try self.findMatchingIdsInner(subdir, prefix, matches, entry.name);
             }
         }
@@ -953,9 +953,9 @@ pub const Storage = struct {
         while (try iter.next()) |entry| {
             // Skip symlinks to prevent infinite loops
             if (entry.kind == .sym_link) continue;
-            if (entry.kind == .directory and !std.mem.eql(u8, entry.name, "archive")) {
+            if ((entry.kind == .directory or entry.kind == .unknown) and !std.mem.eql(u8, entry.name, "archive")) {
                 var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch |err| switch (err) {
-                    error.FileNotFound, error.AccessDenied => continue, // Skip inaccessible dirs
+                    error.FileNotFound, error.AccessDenied, error.NotDir => continue, // Skip inaccessible/non-dirs
                     else => return err,
                 };
                 defer subdir.close();
@@ -1229,7 +1229,7 @@ pub const Storage = struct {
 
             var iter = folder.iterate();
             while (try iter.next()) |entry| {
-                if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+                if ((entry.kind == .file or entry.kind == .unknown) and std.mem.endsWith(u8, entry.name, ".md")) {
                     const child_id = entry.name[0 .. entry.name.len - 3];
                     if (std.mem.eql(u8, child_id, id)) continue; // Skip self
 
@@ -1500,7 +1500,7 @@ pub const Storage = struct {
     fn collectIssuesFromDir(self: *Self, dir: fs.Dir, prefix: []const u8, status_filter: ?Status, issues: *std.ArrayList(Issue)) !void {
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+            if ((entry.kind == .file or entry.kind == .unknown) and std.mem.endsWith(u8, entry.name, ".md")) {
                 const id = entry.name[0 .. entry.name.len - 3];
                 var path_buf: [MAX_PATH_LEN]u8 = undefined;
                 const path = if (prefix.len > 0)
@@ -1525,8 +1525,8 @@ pub const Storage = struct {
                     issue.deinit(self.allocator);
                     return err;
                 };
-            } else if (entry.kind == .directory and !std.mem.eql(u8, entry.name, "archive")) {
-                var subdir = try dir.openDir(entry.name, .{ .iterate = true });
+            } else if ((entry.kind == .directory or entry.kind == .unknown) and !std.mem.eql(u8, entry.name, "archive")) {
+                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
                 defer subdir.close();
 
                 var sub_prefix_buf: [MAX_PATH_LEN]u8 = undefined;
@@ -1605,7 +1605,7 @@ pub const Storage = struct {
         // Only collect from root level of .dots (not archive, not subdirs for children)
         var iter = self.dots_dir.iterate();
         while (try iter.next()) |entry| {
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+            if ((entry.kind == .file or entry.kind == .unknown) and std.mem.endsWith(u8, entry.name, ".md")) {
                 const id = entry.name[0 .. entry.name.len - 3];
                 const issue = self.readIssueFromPath(entry.name, id) catch |err| switch (err) {
                     StorageError.InvalidFrontmatter, StorageError.InvalidStatus => continue,
@@ -1617,12 +1617,12 @@ pub const Storage = struct {
                 } else {
                     issue.deinit(self.allocator);
                 }
-            } else if (entry.kind == .directory and !std.mem.eql(u8, entry.name, "archive")) {
-                // Folder = parent issue
+            } else if ((entry.kind == .directory or entry.kind == .unknown) and !std.mem.eql(u8, entry.name, "archive")) {
+                // Folder = parent issue (for .unknown, readIssueFromPath will fail safely if not a dir)
                 var path_buf: [MAX_PATH_LEN]u8 = undefined;
                 const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.md", .{ entry.name, entry.name }) catch return StorageError.IoError;
                 const issue = self.readIssueFromPath(path, entry.name) catch |err| switch (err) {
-                    StorageError.InvalidFrontmatter, StorageError.InvalidStatus => continue,
+                    StorageError.InvalidFrontmatter, StorageError.InvalidStatus, error.NotDir => continue,
                     else => return err,
                 };
 
@@ -1652,12 +1652,12 @@ pub const Storage = struct {
         var base_path: []const u8 = parent_id;
 
         var folder = self.dots_dir.openDir(parent_id, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                // Try archive
+            error.FileNotFound, error.NotDir => blk: {
+                // Try archive (NotDir means it's a file, not a parent folder)
                 const archive_path = std.fmt.bufPrint(&base_path_buf, "archive/{s}", .{parent_id}) catch return StorageError.IoError;
                 base_path = archive_path;
                 break :blk self.dots_dir.openDir(archive_path, .{ .iterate = true }) catch |err2| switch (err2) {
-                    error.FileNotFound => return children.toOwnedSlice(self.allocator),
+                    error.FileNotFound, error.NotDir => return children.toOwnedSlice(self.allocator),
                     else => return err2,
                 };
             },
@@ -1667,7 +1667,7 @@ pub const Storage = struct {
 
         var iter = folder.iterate();
         while (try iter.next()) |entry| {
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+            if ((entry.kind == .file or entry.kind == .unknown) and std.mem.endsWith(u8, entry.name, ".md")) {
                 const id = entry.name[0 .. entry.name.len - 3];
                 if (std.mem.eql(u8, id, parent_id)) continue; // Skip parent itself
 
