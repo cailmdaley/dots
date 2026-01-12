@@ -3,7 +3,14 @@ const std = @import("std");
 const version = "0.5.4";
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to musl on Linux for portable static binaries
+    // (avoids glibc version issues on older systems)
+    const target = b.standardTargetOptions(.{
+        .default_target = if (@import("builtin").os.tag == .linux)
+            .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }
+        else
+            .{},
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     // Get git short hash (trimmed)
