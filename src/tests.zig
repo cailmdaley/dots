@@ -383,6 +383,7 @@ fn makeTestIssue(id: []const u8, status: Status) Issue {
         .issue_type = "task",
         .assignee = null,
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = if (status == .closed) fixed_timestamp else null,
         .close_reason = null,
         .blocks = &.{},
@@ -1379,6 +1380,7 @@ test "storage: ID prefix resolution" {
         .issue_type = "task",
         .assignee = null,
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -1416,6 +1418,7 @@ test "storage: ambiguous ID prefix errors" {
         .issue_type = "task",
         .assignee = null,
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -1434,6 +1437,7 @@ test "storage: ambiguous ID prefix errors" {
         .issue_type = "task",
         .assignee = null,
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -1617,6 +1621,7 @@ test "prop: lifecycle simulation maintains invariants" {
                                 .issue_type = "task",
                                 .assignee = null,
                                 .created_at = fixed_timestamp,
+                                .due = null,
                                 .closed_at = null,
                                 .close_reason = null,
                                 .blocks = &.{},
@@ -1735,6 +1740,7 @@ test "prop: transitive blocking chains" {
                     .issue_type = "task",
                     .assignee = null,
                     .created_at = fixed_timestamp,
+                    .due = null,
                     .closed_at = closed_at,
                     .close_reason = null,
                     .blocks = &.{},
@@ -1802,6 +1808,7 @@ test "prop: parent-child close constraint" {
                 .issue_type = "task",
                 .assignee = null,
                 .created_at = fixed_timestamp,
+                .due = null,
                 .closed_at = null,
                 .close_reason = null,
                 .blocks = &.{},
@@ -1826,6 +1833,7 @@ test "prop: parent-child close constraint" {
                     .issue_type = "task",
                     .assignee = null,
                     .created_at = fixed_timestamp,
+                    .due = null,
                     .closed_at = if (is_closed) fixed_timestamp else null,
                     .close_reason = null,
                     .blocks = &.{},
@@ -1886,6 +1894,7 @@ test "prop: priority ordering in list" {
                     .issue_type = "task",
                     .assignee = null,
                     .created_at = fixed_timestamp,
+                    .due = null,
                     .closed_at = null,
                     .close_reason = null,
                     .blocks = &.{},
@@ -1937,6 +1946,7 @@ test "prop: status transition state machine" {
                 .issue_type = "task",
                 .assignee = null,
                 .created_at = fixed_timestamp,
+                .due = null,
                 .closed_at = null,
                 .close_reason = null,
                 .blocks = &.{},
@@ -2024,6 +2034,7 @@ test "prop: search finds exactly matching issues" {
                     .issue_type = "task",
                     .assignee = null,
                     .created_at = fixed_timestamp,
+                    .due = null,
                     .closed_at = null,
                     .close_reason = null,
                     .blocks = &.{},
@@ -2045,6 +2056,116 @@ test "prop: search finds exactly matching issues" {
             return true;
         }
     }.property, .{ .iterations = 30, .seed = 0x5EED });
+}
+
+test "prop: yaml round-trip preserves values" {
+    // Test that values survive serialize -> parse cycle without corruption
+    // This guards against the quote-escaping bug where timestamps got double-escaped
+    const YamlCase = struct {
+        // Use bytes to generate strings with various characters
+        title_bytes: [16]u8,
+        reason_bytes: [24]u8,
+        has_newline: bool,
+        has_colon: bool,
+        has_quote: bool,
+    };
+
+    try zc.check(struct {
+        fn property(args: YamlCase) bool {
+            const allocator = std.testing.allocator;
+
+            const test_dir = setupTestDirOrPanic(allocator);
+            defer cleanupTestDirAndFree(allocator, test_dir);
+
+            var ts = openTestStorage(allocator, test_dir);
+            defer ts.deinit();
+
+            // Build a title with potentially tricky characters
+            var title_buf: [64]u8 = undefined;
+            var title_len: usize = 0;
+
+            // Add base title from fuzzed bytes (make it alphanumeric)
+            for (args.title_bytes) |b| {
+                const c = @as(u8, 'a') + (b % 26);
+                title_buf[title_len] = c;
+                title_len += 1;
+            }
+
+            // Optionally add problematic characters
+            if (args.has_newline) {
+                @memcpy(title_buf[title_len..][0..7], "\\nline2");
+                title_len += 7;
+            }
+            if (args.has_colon) {
+                @memcpy(title_buf[title_len..][0..5], ": key");
+                title_len += 5;
+            }
+            if (args.has_quote) {
+                @memcpy(title_buf[title_len..][0..5], " \"hi\"");
+                title_len += 5;
+            }
+
+            const title = title_buf[0..title_len];
+
+            // Build close reason similarly
+            var reason_buf: [64]u8 = undefined;
+            var reason_len: usize = 0;
+            for (args.reason_bytes) |b| {
+                const c = @as(u8, 'a') + (b % 26);
+                reason_buf[reason_len] = c;
+                reason_len += 1;
+            }
+            const reason = reason_buf[0..reason_len];
+
+            // Create issue with these values
+            const issue = Issue{
+                .id = "yaml-roundtrip-test",
+                .title = title,
+                .description = "",
+                .status = .open,
+                .priority = 2,
+                .issue_type = "task",
+                .assignee = null,
+                .created_at = fixed_timestamp,
+                .due = null,
+                .closed_at = null,
+                .close_reason = null,
+                .blocks = &.{},
+                .parent = null,
+            };
+            ts.storage.createIssue(issue, null) catch return false;
+
+            // Read it back - first round trip
+            const read1 = ts.storage.getIssue("yaml-roundtrip-test") catch return false;
+            const issue1 = read1 orelse return false;
+            defer issue1.deinit(allocator);
+
+            // Title should match exactly
+            if (!std.mem.eql(u8, issue1.title, title)) return false;
+
+            // Close it with a reason
+            ts.storage.updateStatus("yaml-roundtrip-test", .closed, fixed_timestamp, reason) catch return false;
+
+            // Read again - second round trip (now through archive)
+            const read2 = ts.storage.getIssue("yaml-roundtrip-test") catch return false;
+            const issue2 = read2 orelse return false;
+            defer issue2.deinit(allocator);
+
+            // Both title and close_reason should match
+            if (!std.mem.eql(u8, issue2.title, title)) return false;
+            if (issue2.close_reason == null) return false;
+            if (!std.mem.eql(u8, issue2.close_reason.?, reason)) return false;
+
+            // Critical: timestamps should not have accumulated quotes
+            // The bug was: "2024-01-01..." becoming "\"2024-01-01...\""
+            if (std.mem.startsWith(u8, issue2.created_at, "\"")) return false;
+            if (issue2.closed_at) |ca| {
+                if (std.mem.startsWith(u8, ca, "\"")) return false;
+            }
+
+            return true;
+        }
+    }.property, .{ .iterations = 50, .seed = 0xCABE });
 }
 
 // Snapshot tests using ohsnap
@@ -2580,6 +2701,7 @@ test "cli: slugify preserves hex suffix from original ID" {
         .issue_type = "task",
         .assignee = "",
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -2630,6 +2752,7 @@ test "cli: slugify updates dependency references" {
         .issue_type = "task",
         .assignee = "",
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -2646,6 +2769,7 @@ test "cli: slugify updates dependency references" {
         .issue_type = "task",
         .assignee = "",
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -2709,6 +2833,7 @@ test "cli: slugify skips already-slugified IDs" {
         .issue_type = "task",
         .assignee = "",
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -2796,6 +2921,7 @@ test "cli: slugify includes closed/archived issues" {
         .issue_type = "task",
         .assignee = "",
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = null,
         .close_reason = null,
         .blocks = &.{},
@@ -2812,6 +2938,7 @@ test "cli: slugify includes closed/archived issues" {
         .issue_type = "task",
         .assignee = "",
         .created_at = fixed_timestamp,
+        .due = null,
         .closed_at = fixed_timestamp,
         .close_reason = "done",
         .blocks = &.{},

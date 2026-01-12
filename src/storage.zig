@@ -295,12 +295,20 @@ const Frontmatter = struct {
 const ParseResult = struct {
     frontmatter: Frontmatter,
     description: []const u8,
-    // Track allocated strings for cleanup
+    // Track allocated strings for cleanup (from parseYamlValue unescaping)
     allocated_blocks: [][]const u8,
     allocated_title: ?[]const u8 = null,
+    allocated_created_at: ?[]const u8 = null,
+    allocated_due: ?[]const u8 = null,
+    allocated_closed_at: ?[]const u8 = null,
+    allocated_close_reason: ?[]const u8 = null,
 
     pub fn deinit(self: *const ParseResult, allocator: Allocator) void {
         if (self.allocated_title) |t| allocator.free(t);
+        if (self.allocated_created_at) |s| allocator.free(s);
+        if (self.allocated_due) |s| allocator.free(s);
+        if (self.allocated_closed_at) |s| allocator.free(s);
+        if (self.allocated_close_reason) |s| allocator.free(s);
         for (self.allocated_blocks) |b| allocator.free(b);
         allocator.free(self.allocated_blocks);
     }
@@ -408,8 +416,16 @@ fn parseFrontmatter(allocator: Allocator, content: []const u8) !ParseResult {
     var fm = Frontmatter{};
     var blocks_list: std.ArrayList([]const u8) = .{};
     var allocated_title: ?[]const u8 = null;
+    var allocated_created_at: ?[]const u8 = null;
+    var allocated_due: ?[]const u8 = null;
+    var allocated_closed_at: ?[]const u8 = null;
+    var allocated_close_reason: ?[]const u8 = null;
     errdefer {
         if (allocated_title) |t| allocator.free(t);
+        if (allocated_created_at) |s| allocator.free(s);
+        if (allocated_due) |s| allocator.free(s);
+        if (allocated_closed_at) |s| allocator.free(s);
+        if (allocated_close_reason) |s| allocator.free(s);
         for (blocks_list.items) |b| allocator.free(b);
         blocks_list.deinit(allocator);
     }
@@ -453,10 +469,26 @@ fn parseFrontmatter(allocator: Allocator, content: []const u8) !ParseResult {
             .priority => fm.priority = std.fmt.parseInt(i64, value, 10) catch return StorageError.InvalidFrontmatter,
             .issue_type => fm.issue_type = value,
             .assignee => fm.assignee = if (value.len > 0) value else null,
-            .created_at => fm.created_at = value,
-            .due => fm.due = if (value.len > 0) value else null,
-            .closed_at => fm.closed_at = if (value.len > 0) value else null,
-            .close_reason => fm.close_reason = if (value.len > 0) value else null,
+            .created_at => {
+                const parsed = try parseYamlValue(allocator, value);
+                fm.created_at = parsed.slice();
+                allocated_created_at = parsed.getOwned();
+            },
+            .due => if (value.len > 0) {
+                const parsed = try parseYamlValue(allocator, value);
+                fm.due = parsed.slice();
+                allocated_due = parsed.getOwned();
+            },
+            .closed_at => if (value.len > 0) {
+                const parsed = try parseYamlValue(allocator, value);
+                fm.closed_at = parsed.slice();
+                allocated_closed_at = parsed.getOwned();
+            },
+            .close_reason => if (value.len > 0) {
+                const parsed = try parseYamlValue(allocator, value);
+                fm.close_reason = parsed.slice();
+                allocated_close_reason = parsed.getOwned();
+            },
             .blocks => in_blocks = true,
         }
     }
@@ -469,6 +501,10 @@ fn parseFrontmatter(allocator: Allocator, content: []const u8) !ParseResult {
         .description = description,
         .allocated_blocks = allocated_blocks,
         .allocated_title = allocated_title,
+        .allocated_created_at = allocated_created_at,
+        .allocated_due = allocated_due,
+        .allocated_closed_at = allocated_closed_at,
+        .allocated_close_reason = allocated_close_reason,
     };
 }
 
@@ -1003,8 +1039,12 @@ pub const Storage = struct {
         defer self.allocator.free(content);
 
         const parsed = try parseFrontmatter(self.allocator, content);
-        // Free allocated_title after duping
+        // Free allocated strings after duping (these are only allocated if the value was YAML-escaped)
         defer if (parsed.allocated_title) |t| self.allocator.free(t);
+        defer if (parsed.allocated_created_at) |s| self.allocator.free(s);
+        defer if (parsed.allocated_due) |s| self.allocator.free(s);
+        defer if (parsed.allocated_closed_at) |s| self.allocator.free(s);
+        defer if (parsed.allocated_close_reason) |s| self.allocator.free(s);
         // Free allocated_blocks on error (transferred to Issue on success)
         var blocks_transferred = false;
         errdefer if (!blocks_transferred) {
